@@ -58,6 +58,29 @@
 //   · get_logs / get_logs_count / get_logs_export بقوا على Log Filter Model v2
 //     (قوايم employees/types + dateFrom/dateTo + cap/total/truncated)
 //   · get_summary + get_attention — أرقام الشاشة والصفوف المحتاجة انتباه
+//
+// v2.5.0 — 12-09-2026 — ⚠️ إصلاح: مصاريف الشحن كانت بتضيع بالكامل
+// السبب (مؤكد 100% من الكود + Shopify + D1): buildDraftInput() كانت
+// بتبني الـ DraftOrderInput من غير shippingLine خالص (قرار قديم اتكتب
+// وقت ما WooCommerce كان شحنه صفر على كل الأوردرات). Shopify **مابيحسبش**
+// شحن لوحده للـ draft order — بياخد اللي تديهوله بس، فكل أوردر كان بيتقفل
+// بـ shippingLines = [] و totalShippingPriceSet = 0.
+//
+// الباج كان **كامن** من أول يوم وما ظهرش غير لما stylebox.online فعّلت
+// الـ Flat rate يوم 10-09-2026. الدليل من D1 — فرق (wc_total − مجموع
+// الأصناف) على كل الـ 797 أوردر:
+//   794 أوردر → 0     (WooCommerce نفسه كان شحنه صفر)
+//     3 أوردر → 75/100/75   (#54220 · #54396 · #54425 — من 10-09 فما بعد)
+// والفرق ده هو **بالظبط** قيمة الشحن الضايعة على شوبيفاي في كل مرة.
+//
+// الحل: buildShippingLine() بتضيف shippingLine **دايمًا** (قرار Ahmed
+// 12-09-2026 — الشحن بصفر بيظهر كسطر بصفر، عشان كل الأوردرات الجديدة
+// يبقى شكلها واحد). الأوردرات القديمة **مش بتتصلح تلقائيًا** — تتساب
+// زي ما هي (نفس قرار v2.3.1 مع العناوين).
+//
+// ⚠️ الضرايب: shipping_total في WooCommerce **مش شامل** ضريبة الشحن
+// (shipping_tax حقل منفصل). المتجر شغال من غير ضرايب نهائيًا وده قرار
+// ثابت — لو اتغير في أي يوم، لازم يترجع للبند ده.
 // skills: worker-builder v3.0.0 · constants v2.0.0 · html-builder v7.0.0 — 12-09-2026
 // ══════════════════════════════════════════════════════════════════════
 
@@ -67,7 +90,7 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
-const WORKER_VERSION    = 'v2.4.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const WORKER_VERSION    = 'v2.5.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
 const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
 
 // الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
@@ -570,6 +593,41 @@ async function findOrCreateCustomer(env, token, billing) {
   return res.data?.customerCreate?.customer?.id || null;
 }
 
+// ─── §WEBHOOK::buildShippingLine ──────────────────────────────────────
+/**
+ * WooCommerce shipping → Shopify ShippingLineInput  (v2.5.0)
+ *
+ * ⚠️ Shopify بياخد **سطر شحن واحد بس** في الـ draft order — الحقل
+ * `shippingLine` مفرد مش list. فالمبلغ بيتاخد من `shipping_total` (وده
+ * رقم WooCommerce بيجمع فيه كل سطور الشحن، فلو فيه أكتر من سطر الفلوس
+ * بتفضل مضبوطة)، والعنوان بيتاخد من أول سطر بس.
+ *
+ * السطر بيتضاف **دايمًا** حتى لو الشحن بصفر — قرار Ahmed 12-09-2026.
+ *
+ * ⚠️ `shipping_total` **مستثنى منه ضريبة الشحن** (`shipping_tax` حقل
+ * منفصل في WooCommerce). المتجر من غير ضرايب وده قرار ثابت — أي تفعيل
+ * للضرايب مستقبلاً بيخلي السطر ده ناقص.
+ *
+ * ⚠️ decodeHtmlEntities على العنوان لنفس سبب v2.3.1 — `method_title`
+ * نص جاي من WooCommerce، وممكن يوصل بترميز HTML ("Delivery &amp; Handling").
+ *
+ * مصدر الحقول:
+ *  · WooCommerce REST API v3 — order.shipping_total · order.shipping_lines[].method_title
+ *  · Shopify GraphQL Admin 2026-01 — ShippingLineInput { priceWithCurrency, title }
+ *    ⚠️ `price` (Money) في نفس الـ input **deprecated** — المستخدم هنا
+ *    `priceWithCurrency` (MoneyInput) زي `priceOverride` بالظبط.
+ */
+function buildShippingLine(body) {
+  const amount = parseFloat(body.shipping_total);
+  return {
+    title: decodeHtmlEntities(body.shipping_lines?.[0]?.method_title?.trim()) || 'Shipping',
+    priceWithCurrency: {
+      amount:       (Number.isFinite(amount) ? amount : 0).toFixed(2),
+      currencyCode: STORE_CURRENCY,
+    },
+  };
+}
+
 // ─── §WEBHOOK::buildDraftInput ────────────────────────────────────────
 /**
  * Build DraftOrderInput from WooCommerce order body
@@ -615,7 +673,9 @@ function buildDraftInput(body, customerId) {
     lineItems,
     shippingAddress: buildAddress(wcShipping),
     billingAddress:  buildAddress(body.billing),
-    // بدون shippingLine — قرار Ahmed: نسيبها فاضية
+    // v2.5.0 — سطر الشحن بيتبعت دايمًا (كان محذوف بالكامل قبل كده — راجع
+    // الهيدر). من غيره Shopify بيقفل الأوردر بإجمالي ناقص قيمة الشحن.
+    shippingLine:    buildShippingLine(body),
     // _worker_clone: يمنع Shopify Flow من عمل clone للـ draft ده
     tags: ['StyleBox', '_worker_clone'],
   };
@@ -844,6 +904,10 @@ async function syncOrderToShopify(body, env) {
         wc_order_id:        wcOrderId,
         wc_order_num:       wcOrderNum,
         wc_total:           body.total,
+        // v2.5.0 — بيتسجّل عشان التحقق من الشحن يبقى ممكن من السجل نفسه:
+        // عمود «الإجمالي» في الشاشة بيعرض wc_total، فلو الشحن ضاع تاني
+        // على شوبيفاي مفيش أي طريقة تكشفه من الواجهة من غير الحقل ده.
+        wc_shipping_total:  body.shipping_total ?? null,
         shopify_order_id:   order.id,
         shopify_order_name: order.name,
         financial_status:   order.displayFinancialStatus,
