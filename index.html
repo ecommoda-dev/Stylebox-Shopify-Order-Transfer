@@ -2119,14 +2119,17 @@ function renderFreshness() {
 // ─── §TOOL-JS::kpis ────────────────────────────────────────────
 // Δ% محتاج مقام معقول — مش بس مقام مش صفر. 10200% مش رقم.
 const MIN_DELTA_BASE = 5;
-function deltaHtml(cur, prev) {
+// ⚠️ invert = الزيادة حاجة وحشة (الأخطاء) — من غيرها السهم الأخضر بيقول
+//    "تمام" على عدد أخطاء بيزيد، وده أسوأ من عدم عرض المقارنة أصلاً.
+function deltaHtml(cur, prev, invert = false) {
   if (prev == null) return '<div class="kpi-delta neutral">مفيش فترة سابقة للمقارنة</div>';
   if (prev === 0 && cur === 0) return '<div class="kpi-delta neutral">زي الفترة السابقة (صفر)</div>';
   if (prev < MIN_DELTA_BASE) {
     return `<div class="kpi-delta neutral">${fmtInt(prev)} ← ${fmtInt(cur)} عن الفترة السابقة</div>`;
   }
   const pct = ((cur - prev) / prev) * 100;
-  const cls = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'neutral');
+  const good = invert ? pct < 0 : pct > 0;
+  const cls = pct === 0 ? 'neutral' : (good ? 'up' : 'down');
   const arw = pct > 0 ? '▲' : (pct < 0 ? '▼' : '=');
   return `<div class="kpi-delta ${cls}">${arw} ${Math.abs(pct).toFixed(1)}% عن الفترة السابقة</div>`;
 }
@@ -2156,7 +2159,7 @@ function renderKpis(d) {
       value: c.error || 0,
       state: (c.error || 0) > 0 ? 'state-bad' : 'state-good',
       hint:  'محاولة نقل فشلت — التفاصيل في تاب السجل',
-      delta: deltaHtml(c.error || 0, p ? (p.error || 0) : null),
+      delta: deltaHtml(c.error || 0, p ? (p.error || 0) : null, true),  // زيادة الأخطاء = أحمر
     }),
     kpiCard({
       label: 'أحداث متخطّاة',
