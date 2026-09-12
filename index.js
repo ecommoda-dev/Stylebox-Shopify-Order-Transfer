@@ -48,7 +48,18 @@
 // Shopify — في buildAddress() وفي findOrCreateCustomer(). أوردرات اتعملت
 // قبل الإصلاح ده مش بتتصلح تلقائياً (لازم تعديل يدوي من Shopify Admin —
 // الأوردر editable لأنه معمول عن طريق draftOrderComplete).
-// ══════════════════════════════════════════════════════════════════════// ══════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════//
+// v2.4.0 — 12-09-2026 — إضافة نصف الواجهة (شاشة عرض على GitHub Pages).
+// ⚠️ مسار الويبهوك (§WEBHOOK) و§SHOPIFY ما اتلمسوش خالص — التغيير كله
+// endpoints قراءة جديدة + شاشة دخول:
+//   · Universal D1 Auth (check_employee · register_pin · verify_employee ·
+//     log_logout · get_employees) → بيكتب login/logout تحت نفس الـ TOOL_NAME
+//   · get_config + diag — حارس نسخة الـ Worker والفحص الذاتي
+//   · get_logs / get_logs_count / get_logs_export بقوا على Log Filter Model v2
+//     (قوايم employees/types + dateFrom/dateTo + cap/total/truncated)
+//   · get_summary + get_attention — أرقام الشاشة والصفوف المحتاجة انتباه
+// skills: worker-builder v3.0.0 · constants v2.0.0 · html-builder v7.0.0 — 12-09-2026
+// ══════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════
 // §CONSTANTS
@@ -56,6 +67,15 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
+const WORKER_VERSION    = 'v2.4.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
+
+// الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
+// من العميل وجدول logs مشترك بين كل أدوات الستاك.
+const AUTH_APPS = new Set([TOOL_NAME]);
+function resolveAuthTool(appId) { return AUTH_APPS.has(appId) ? appId : TOOL_NAME; }
+
+const LOG_EXPORT_MAX = 2000;   // سقف التصدير — بيرجع للواجهة كـ cap
 
 // ══════════════════════════════════════════════════════════════════════
 // §CORS
@@ -158,46 +178,121 @@ async function writeLog(db, entry) {
   ).run();
 }
 
-async function getLogs(db, { tool=null,employee=null,type=null,search=null,limit=100,offset=0 }={}) {
-  let sql = "SELECT * FROM logs WHERE type NOT IN ('login','logout')";
+/**
+ * ⚠️ Log Filter Model v2 (v2.4.0) — الدوال التلاتة تحت بقت بتتبني على
+ * buildLogFilterSQL بدل SQL مكرر في كل واحدة. النسخة دي هي المعتمدة في
+ * `ecommoda-worker-builder` → references/shared-functions.md، والسلوك من غير
+ * الباراميترات الجديدة **مطابق للقديم بالحرف** (متوافق رجوعيًا ١٠٠٪).
+ *
+ *   employees[] / types[] → قوايم (multi-select إلزامي في أي شاشة فيها جدول)
+ *   employee / type       → قيمة واحدة — متسابة للتوافق الرجعي
+ *   dateFrom / dateTo     → بيتقارنوا بـ substr(timestamp,1,10) يعني **UTC**،
+ *                           والعرض بتوقيت القاهرة. فرق الساعتين/التلاتة ممكن
+ *                           يحط عملية بالليل في يوم UTC اللي بعده — مقبول
+ *                           لفلتر بالأيام، بس مكتوب عشان مايتكتشفش كباج بعدين.
+ */
+function buildLogFilterSQL(select, {
+  tool      = null,
+  employee  = null, employees = null,
+  type      = null, types     = null,
+  search    = null,
+  dateFrom  = null, dateTo    = null,
+} = {}) {
+  let sql = `${select} FROM logs WHERE type NOT IN ('login','logout')`;
   const b = [];
-  if (tool)     { sql += ' AND tool = ?';     b.push(tool); }
-  if (employee) { sql += ' AND employee = ?'; b.push(employee); }
-  if (type)     { sql += ' AND type = ?';     b.push(type); }
+
+  const emps = Array.isArray(employees) && employees.length ? employees : (employee ? [employee] : []);
+  const typs = Array.isArray(types)     && types.length     ? types     : (type     ? [type]     : []);
+
+  if (tool) { sql += ' AND tool = ?'; b.push(tool); }
+  if (emps.length) {
+    sql += ` AND employee IN (${emps.map(() => '?').join(',')})`; b.push(...emps);
+  }
+  if (typs.length) {
+    sql += ` AND type IN (${typs.map(() => '?').join(',')})`; b.push(...typs);
+  }
   if (search) {
     sql += ' AND (order_name LIKE ? OR notes LIKE ?)';
     b.push(`%${search}%`, `%${search}%`);
   }
-  sql += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?';
-  b.push(Math.min(limit, 100), offset);
-  return (await db.prepare(sql).bind(...b).all()).results;
+  if (dateFrom) { sql += ' AND substr(timestamp, 1, 10) >= ?'; b.push(dateFrom); }
+  if (dateTo)   { sql += ' AND substr(timestamp, 1, 10) <= ?'; b.push(dateTo); }
+
+  return { sql, b };
 }
 
-async function getLogsCount(db, { tool=null,employee=null,search=null }={}) {
-  let sql = "SELECT COUNT(*) as total FROM logs WHERE type NOT IN ('login','logout')";
-  const b = [];
-  if (tool)     { sql += ' AND tool = ?';     b.push(tool); }
-  if (employee) { sql += ' AND employee = ?'; b.push(employee); }
-  if (search) {
-    sql += ' AND (order_name LIKE ? OR notes LIKE ?)';
-    b.push(`%${search}%`, `%${search}%`);
-  }
+// ⚠️ قائمة **مقفولة** — القيمة جاية من العميل وبتتلزق في نص SQL مباشرةً
+//    (ORDER BY مابيقبلش bind). أي قيمة بره القايمة بترجع للافتراضي بدون خطأ.
+// ⚠️ المفاتيح لازم تطابق `data-sort-key` في الواجهة **حرفيًا**.
+const LOG_SORT_COLUMNS = {
+  date: 'timestamp', time: 'timestamp', employee: 'employee',
+  orderName: 'order_name', type: 'type',
+};
+
+function orderByClause(sortBy, sortDir) {
+  const col = LOG_SORT_COLUMNS[String(sortBy || '')] || 'timestamp';
+  const dir = String(sortDir || '').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  // 🔴 كاسر تعادل إلزامي: من غيره صفوف نفس القيمة بترتيب عشوائي بين الصفحات،
+  //    والصف الواحد ممكن يظهر في صفحتين **أو مايظهرش خالص**.
+  return col === 'timestamp' ? ` ORDER BY timestamp ${dir}`
+                             : ` ORDER BY ${col} ${dir}, timestamp DESC`;
+}
+
+async function getLogs(db, { limit = 100, offset = 0, sortBy, sortDir, ...filters } = {}) {
+  const { sql, b } = buildLogFilterSQL('SELECT *', filters);
+  const q = sql + orderByClause(sortBy, sortDir) + ' LIMIT ? OFFSET ?';
+  return (await db.prepare(q)
+    .bind(...b, Math.min(limit, 100), Math.max(offset, 0)).all()).results;
+}
+
+async function getLogsCount(db, filters = {}) {
+  const { sql, b } = buildLogFilterSQL('SELECT COUNT(*) as total', filters);
   const row = await db.prepare(sql).bind(...b).first();
   return row?.total ?? 0;
 }
 
-async function getLogsExport(db, { tool=null,employee=null,search=null }={}) {
-  let sql = "SELECT * FROM logs WHERE type NOT IN ('login','logout')";
-  const b = [];
-  if (tool)     { sql += ' AND tool = ?';     b.push(tool); }
-  if (employee) { sql += ' AND employee = ?'; b.push(employee); }
-  if (search) {
-    sql += ' AND (order_name LIKE ? OR notes LIKE ?)';
-    b.push(`%${search}%`, `%${search}%`);
-  }
-  sql += ' ORDER BY timestamp DESC LIMIT 2000';
-  return (await db.prepare(sql).bind(...b).all()).results;
+/**
+ * ⚠️ بتقص عند LOG_EXPORT_MAX **في السكوت** — فالـ endpoint لازم يرجّع
+ * cap و total و truncated كمان، وإلا الواجهة بتقول "تم التصدير ✓" على ملف ناقص.
+ */
+async function getLogsExport(db, filters = {}) {
+  const { sql, b } = buildLogFilterSQL('SELECT *', filters);
+  // التصدير والعدّ بيتجاهلوا الترتيب عن قصد — التصدير بياخد ترتيب السيرفر الافتراضي.
+  const q = sql + ' ORDER BY timestamp DESC LIMIT ?';
+  return (await db.prepare(q).bind(...b, LOG_EXPORT_MAX).all()).results;
 }
+
+/**
+ * بيقرا فلاتر السجل من الـ query string — CSV للقوايم
+ * (employees=ahmed,sara · types=created,error). الاسم المفرد لسه مقبول.
+ */
+function logParamsFrom(url, tool) {
+  const csv = (k) => (url.searchParams.get(k) || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const employees = csv('employees'), types = csv('types');
+  return {
+    tool,
+    employees: employees.length ? employees : null,
+    employee:  url.searchParams.get('employee') || null,
+    types:     types.length ? types : null,
+    type:      url.searchParams.get('type')     || null,
+    search:    url.searchParams.get('search')   || null,
+    dateFrom:  url.searchParams.get('dateFrom') || null,
+    dateTo:    url.searchParams.get('dateTo')   || null,
+  };
+}
+
+/**
+ * متغيّر ناقص لازم يوقف العملية **برسالة باسمه** — مش يفشل جوه استعلام
+ * برسالة غامضة بعدين.
+ */
+function assertEnv(env, names) {
+  const missing = names.filter(n => !env[n]);
+  if (missing.length) {
+    throw new Error(`متغيّرات ناقصة في الـ Worker: ${missing.join(', ')} — راجع الداشبورد ثم Promote`);
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // END §SHARED
 // ══════════════════════════════════════════════════════════════════════
@@ -818,41 +913,307 @@ export default {
     // ─────────────────────────────────────────────────────────────
 
     // ── كل الـ endpoints التانية: WORKER_SECRET مطلوب ─────────────
+    // 🔴 السر الناقص بيترد عليه برسالة باسمه — مش 401 غامض. من غير الحارس
+    //    ده، سر اتضاف من غير Promote بيدّي "Unauthorized" على كل نداء
+    //    والموظف بيدوّر في المكان الغلط.
+    if (!env.WORKER_SECRET) {
+      return json({ ok: false, error: 'WORKER_SECRET ناقص في الـ Worker — ضيفه في Settings → Variables and Secrets ثم Promote', step: 'env' }, 500);
+    }
     const authHeader = request.headers.get('Authorization') || '';
     if (authHeader !== `Bearer ${env.WORKER_SECRET}`) {
       return json({ ok: false, error: 'Unauthorized' }, 401);
     }
 
     try {
-      // ─── §LOG-ENDPOINTS ───────────────────────────────────────────
+      // ─── §CONFIG-ENDPOINTS ────────────────────────────────────────
+
+      // حارس نسخة الـ Worker في الواجهة بيقرا من هنا (Promote ناقص / Worker شبح)
+      if (action === 'get_config') {
+        return json({ ok: true, version: WORKER_VERSION, tool: TOOL_NAME });
+      }
+
+      // فحص ذاتي — بدون أي كتابة. ⚠️ ممنوع يعرض قيمة أي سر: أسماء وأطوال بس.
+      if (action === 'diag') {
+        const checks = [];
+        const envKeys = Object.keys(env).sort().map(k => ({
+          name:   k,
+          type:   typeof env[k],
+          // الطول بيكشف المسافة المخفية في آخر السر — من غير ما يعرض القيمة
+          length: typeof env[k] === 'string' ? env[k].length : null,
+        }));
+
+        for (const name of ['WORKER_SECRET', 'WC_WEBHOOK_SECRET', 'CLIENT_ID', 'CLIENT_SECRET']) {
+          checks.push({
+            ok:     !!env[name],
+            label:  name,
+            detail: env[name]
+              ? `موجود — الطول ${String(env[name]).length} حرف`
+              : 'ناقص — ضيفه في Settings → Variables and Secrets ثم Promote',
+          });
+        }
+        checks.push({
+          ok:     !!env.SHOP_DOMAIN,
+          label:  'SHOP_DOMAIN',
+          detail: env.SHOP_DOMAIN ? String(env.SHOP_DOMAIN) : 'ناقص — راجع [vars] في wrangler.toml',
+        });
+        checks.push({
+          ok:     !!env.COD_GATEWAY_ID,
+          label:  'COD_GATEWAY_ID',
+          detail: env.COD_GATEWAY_ID
+            ? String(env.COD_GATEWAY_ID)
+            : `غير مضبوط — الكود بيرجع للقيمة الافتراضية (${COD_GATEWAY_GID}). المتغيّر ده ليه fallback، فغيابه مابيوقّفش الأداة`,
+        });
+        checks.push({
+          ok:     !!env.DB,
+          label:  'D1 binding (DB)',
+          detail: env.DB ? 'موجود في wrangler.toml' : 'ناقص — راجع [[d1_databases]] في wrangler.toml',
+        });
+
+        try {
+          const row = await env.DB.prepare(
+            'SELECT COUNT(*) AS n FROM logs WHERE tool = ?'
+          ).bind(TOOL_NAME).first();
+          checks.push({ ok: true, label: 'جدول logs', detail: `${row?.n ?? 0} صف باسم الأداة (tool = '${TOOL_NAME}')` });
+        } catch (e) {
+          checks.push({ ok: false, label: 'جدول logs', detail: `فشل الاستعلام: ${e.message}` });
+        }
+
+        try {
+          const row = await env.DB.prepare(
+            'SELECT COUNT(*) AS n FROM wc_order_sync_ledger'
+          ).first();
+          checks.push({ ok: true, label: 'جدول wc_order_sync_ledger', detail: `${row?.n ?? 0} صف — سجل الحماية من التكرار` });
+        } catch (e) {
+          checks.push({ ok: false, label: 'جدول wc_order_sync_ledger', detail: `فشل الاستعلام: ${e.message}` });
+        }
+
+        try {
+          const row = await env.DB.prepare(
+            'SELECT COUNT(*) AS n FROM employees WHERE is_active = 1'
+          ).first();
+          checks.push({ ok: true, label: 'جدول employees', detail: `${row?.n ?? 0} موظف نشط` });
+        } catch (e) {
+          checks.push({ ok: false, label: 'جدول employees', detail: `فشل الاستعلام: ${e.message}` });
+        }
+
+        checks.push({
+          ok:     true,
+          label:  'CORS',
+          detail: `wildcard * — الأداة قراءة فقط من الواجهة، والحماية في WORKER_SECRET. الطلب جاي من ${request.headers.get('Origin') || '(بدون Origin)'}`,
+        });
+
+        return json({ ok: true, version: WORKER_VERSION, tool: TOOL_NAME, envKeys, checks });
+      }
+
+      assertEnv(env, ['DB']);
+
+      // ─── §AUTH-ENDPOINTS — Universal D1 Auth ──────────────────────
+
+      if (action === 'get_employees') {
+        const { results } = await env.DB.prepare(
+          'SELECT username, display_name FROM employees WHERE is_active = 1 ORDER BY display_name'
+        ).all();
+        return json({ ok: true, employees: results });
+      }
+
+      if (action === 'check_employee') {
+        const username = url.searchParams.get('username');
+        if (!username) return json({ ok: false, error: 'username مطلوب' }, 400);
+        const result = await checkEmployee(env.DB, username);
+        return json({ ok: true, ...result });
+      }
+
+      if (action === 'register_pin') {
+        if (request.method !== 'POST') return json({ ok: false, error: 'POST required' }, 405);
+        const { username, pin } = await request.json().catch(() => ({}));
+        if (!username || !pin) return json({ ok: false, error: 'username و pin مطلوبان' }, 400);
+        await registerPin(env.DB, username, pin);
+        return json({ ok: true });
+      }
+
+      if (action === 'verify_employee') {
+        if (request.method !== 'POST') return json({ ok: false, error: 'POST required' }, 405);
+        const { username, pin, appId } = await request.json().catch(() => ({}));
+        if (!username || !pin) return json({ ok: false, error: 'username و pin مطلوبان' }, 400);
+
+        const displayName = await verifyEmployee(env.DB, username, pin);
+        if (!displayName) return json({ ok: false, error: 'PIN خطأ أو المستخدم غير موجود' }, 401);
+
+        // ⚠️ الدخول نفسه نجح فعلاً فوق. فشل D1 بعد كده بيترجع كـ logged:false —
+        //    مش بيسقّط الرد كله على 500 لدخول حصل فعلاً.
+        let logged = true;
+        try {
+          await writeLog(env.DB, {
+            tool:     resolveAuthTool(appId),
+            type:     'login',
+            employee: username,
+            notes:    `دخول: ${displayName}`,
+          });
+        } catch (_) { logged = false; }
+
+        return json({ ok: true, displayName, logged });
+      }
+
+      if (action === 'log_logout') {
+        const username = url.searchParams.get('username');
+        const appId    = url.searchParams.get('appId');
+        let logged = true;
+        if (username) {
+          try {
+            await writeLog(env.DB, {
+              tool:     resolveAuthTool(appId),
+              type:     'logout',
+              employee: username,
+              notes:    `خروج: ${username.replace(/_/g, ' ')}`,
+            });
+          } catch (_) { logged = false; }
+        }
+        return json({ ok: true, logged });
+      }
+
+      // ─── §LOG-ENDPOINTS — Log Filter Model v2 ─────────────────────
 
       if (action === 'get_logs') {
-        const employee = url.searchParams.get('employee') || null;
-        const type     = url.searchParams.get('type')     || null;  // ⚠️ v2.0.0 — كان ناقص
-        const search   = url.searchParams.get('search')   || null;
-        const limit    = Math.min(parseInt(url.searchParams.get('limit')  || '100'), 100);
-        const offset   = Math.max(parseInt(url.searchParams.get('offset') || '0'),    0);
-        const entries  = await getLogs(env.DB, { tool: TOOL_NAME, employee, type, search, limit, offset });
+        const p = logParamsFrom(url, TOOL_NAME);
+        // 🔴 parseInt('abc') → NaN → بيوصل D1 كـ bind ويرجّع خطأ غامض.
+        const limitRaw  = parseInt(url.searchParams.get('limit')  || '100', 10);
+        const offsetRaw = parseInt(url.searchParams.get('offset') || '0',   10);
+        const limit  = Number.isFinite(limitRaw)  ? Math.min(Math.max(limitRaw, 1), 100) : 100;
+        const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
+
+        const entries = await getLogs(env.DB, {
+          ...p, limit, offset,
+          sortBy:  url.searchParams.get('sortBy'),
+          sortDir: url.searchParams.get('sortDir'),
+        });
         return json({ ok: true, entries });
       }
 
       if (action === 'get_logs_count') {
-        const employee = url.searchParams.get('employee') || null;
-        const search   = url.searchParams.get('search')   || null;
-        const total    = await getLogsCount(env.DB, { tool: TOOL_NAME, employee, search });
+        const total = await getLogsCount(env.DB, logParamsFrom(url, TOOL_NAME));
         return json({ ok: true, total });
       }
 
       if (action === 'get_logs_export') {
-        const employee = url.searchParams.get('employee') || null;
-        const search   = url.searchParams.get('search')   || null;
-        const entries  = await getLogsExport(env.DB, { tool: TOOL_NAME, employee, search });
-        return json({ ok: true, entries });
+        const p = logParamsFrom(url, TOOL_NAME);
+        const [entries, total] = await Promise.all([
+          getLogsExport(env.DB, p),
+          getLogsCount(env.DB, p),   // العدّ الحقيقي جنب الصفوف — بنفس الفلاتر بالظبط
+        ]);
+        return json({ ok: true, entries, cap: LOG_EXPORT_MAX, total,
+                      truncated: total > LOG_EXPORT_MAX });
+      }
+
+      // ─── §VIEW-ENDPOINTS — أرقام شاشة العرض ───────────────────────
+
+      /**
+       * ملخّص الفترة + الفترة السابقة (بنفس الطول) + حالة الـ ledger الحالية.
+       * ⚠️ صفوف الـ logs **أحداث** (اللي حصل وقتها ما بيتغيّرش)، أما الـ ledger
+       *    فحالة حالية — عشان كده الاتنين بيرجعوا منفصلين ومش بيتكاشوا.
+       */
+      if (action === 'get_summary') {
+        const dateFrom = url.searchParams.get('dateFrom') || null;
+        const dateTo   = url.searchParams.get('dateTo')   || null;
+
+        const countsFor = async (from, to) => {
+          let sql = 'SELECT type, COUNT(*) AS n FROM logs WHERE tool = ?';
+          const b = [TOOL_NAME];
+          if (from) { sql += ' AND substr(timestamp, 1, 10) >= ?'; b.push(from); }
+          if (to)   { sql += ' AND substr(timestamp, 1, 10) <= ?'; b.push(to); }
+          sql += ' GROUP BY type';
+          const { results } = await env.DB.prepare(sql).bind(...b).all();
+          const out = { created: 0, skipped: 0, error: 0 };
+          for (const r of results) out[r.type] = r.n;
+          return out;
+        };
+
+        // الفترة السابقة = نفس عدد الأيام، ملزوقة قبل الفترة الحالية
+        let prevFrom = null, prevTo = null;
+        if (dateFrom && dateTo) {
+          const MS_DAY = 24 * 60 * 60 * 1000;
+          const f = Date.parse(`${dateFrom}T00:00:00.000Z`);
+          const t = Date.parse(`${dateTo}T00:00:00.000Z`);
+          if (Number.isFinite(f) && Number.isFinite(t) && t >= f) {
+            const days = Math.round((t - f) / MS_DAY) + 1;
+            prevTo   = new Date(f - MS_DAY).toISOString().slice(0, 10);
+            prevFrom = new Date(f - days * MS_DAY).toISOString().slice(0, 10);
+          }
+        }
+
+        const staleBefore = new Date(Date.now() - STALE_LEDGER_MS).toISOString();
+
+        const [counts, prev, ledgerRows, staleRow, lastRow] = await Promise.all([
+          countsFor(dateFrom, dateTo),
+          prevFrom ? countsFor(prevFrom, prevTo) : Promise.resolve(null),
+          env.DB.prepare('SELECT status, COUNT(*) AS n FROM wc_order_sync_ledger GROUP BY status').all(),
+          env.DB.prepare(
+            "SELECT COUNT(*) AS n FROM wc_order_sync_ledger WHERE status = 'in_progress' AND claimed_at < ?"
+          ).bind(staleBefore).first(),
+          env.DB.prepare('SELECT MAX(timestamp) AS ts FROM logs WHERE tool = ?').bind(TOOL_NAME).first(),
+        ]);
+
+        const ledger = { completed: 0, failed: 0, in_progress: 0 };
+        for (const r of ledgerRows.results) ledger[r.status] = r.n;
+
+        return json({
+          ok: true,
+          version:     WORKER_VERSION,
+          period:      { from: dateFrom, to: dateTo },
+          prevPeriod:  prevFrom ? { from: prevFrom, to: prevTo } : null,
+          counts,
+          prev,
+          ledger,
+          staleInProgress: staleRow?.n ?? 0,
+          lastEventAt:     lastRow?.ts ?? null,
+          generatedAt:     new Date().toISOString(),
+        });
+      }
+
+      /**
+       * الصفوف المحتاجة انتباه: أي أوردر في الـ ledger حالته failed، أو
+       * in_progress عدّى عليه أكتر من STALE_LEDGER_MS (يعني التنفيذ اتقطع).
+       * ومعاها آخر رسالة خطأ لكل أوردر من الـ logs.
+       */
+      if (action === 'get_attention') {
+        const staleBefore = new Date(Date.now() - STALE_LEDGER_MS).toISOString();
+        const { results: rows } = await env.DB.prepare(
+          `SELECT wc_order_id, status, claimed_at, shopify_order_id, shopify_order_name, completed_at
+             FROM wc_order_sync_ledger
+            WHERE status = 'failed' OR (status = 'in_progress' AND claimed_at < ?)
+            ORDER BY claimed_at DESC LIMIT 100`
+        ).bind(staleBefore).all();
+
+        const ids = rows.map(r => String(r.wc_order_id));
+        let lastErrors = {};
+        if (ids.length) {
+          const { results: errs } = await env.DB.prepare(
+            `SELECT json_extract(extra, '$.wc_order_id') AS wc_order_id, notes, timestamp
+               FROM logs
+              WHERE tool = ? AND type = 'error'
+                AND CAST(json_extract(extra, '$.wc_order_id') AS TEXT) IN (${ids.map(() => '?').join(',')})
+              ORDER BY timestamp DESC`
+          ).bind(TOOL_NAME, ...ids).all();
+          for (const e of errs) {
+            const k = String(e.wc_order_id);
+            if (!lastErrors[k]) lastErrors[k] = { notes: e.notes, timestamp: e.timestamp };
+          }
+        }
+
+        return json({
+          ok: true,
+          rows: rows.map(r => ({
+            ...r,
+            stale:     r.status === 'in_progress',
+            lastError: lastErrors[String(r.wc_order_id)] || null,
+          })),
+          staleThresholdMs: STALE_LEDGER_MS,
+          generatedAt:      new Date().toISOString(),
+        });
       }
 
       // ─── Status check (للـ debugging والتأكد إن الـ Worker شغال) ──
       if (action === 'status') {
-        return json({ ok: true, tool: TOOL_NAME, ts: new Date().toISOString() });
+        return json({ ok: true, tool: TOOL_NAME, version: WORKER_VERSION, ts: new Date().toISOString() });
       }
 
       // ──────────────────────────────────────────────────────────────
