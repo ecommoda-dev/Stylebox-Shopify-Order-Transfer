@@ -1,0 +1,34 @@
+# ⚠️ name لازم يطابق اسم الـ Worker في داشبورد Cloudflare حرف بحرف.
+#    لو اختلفوا، الـ build مش بيفشل — بينشر Worker جديد والأصلي بيتجمّد بصمت.
+
+name               = "stylebox-shopify-order-transfer-worker"
+main               = "index.js"
+compatibility_date = "2025-01-01"
+workers_dev        = true
+
+[observability]
+enabled = true
+
+# ─── D1 ──────────────────────────────────────────────
+# الـ binding دايمًا "DB" — أي اسم تاني والكتابة بتفشل بصمت.
+# الأداة بتستخدم جدولين في نفس القاعدة: logs (المشترك) و
+# wc_order_sync_ledger (خاص بالأداة — الحماية من تكرار الأوردر).
+[[d1_databases]]
+binding       = "DB"
+database_name = "ecommoda-dev-logs"
+database_id   = "90db62d3-bd7e-4d92-912b-10fc78eeb565"
+
+# ─── Vars (نص عادي — مش أسرار) ────────────────────────
+# دي بتتطبّق فعليًا مع Workers Builds (اتأكد 22-08-2026).
+#
+# 🔴 COD_GATEWAY_ID ليه fallback في الكود (env.COD_GATEWAY_ID || COD_GATEWAY_GID)
+#    — يعني لو ضاع، الأداة **بتكمّل شغل عادي** وبتكتب سجلات نجاح سليمة.
+#    مكتوب هنا بنفس قيمة الداشبورد بالظبط عشان الريبو يبقى مصدر القيمة.
+[vars]
+SHOP_DOMAIN    = "6c7e1a-53.myshopify.com"
+COD_GATEWAY_ID = "gid://shopify/PaymentGateway/125688283458"
+
+# ⚠️ الأسرار مبتتكتبش هنا أبدًا.
+#    Worker → Settings → Variables and Secrets → علّم Secret
+#    وبعدها: Deployments → Version History → ⋯ → Promote version
+#    أسرار الأداة دي: WORKER_SECRET · WC_WEBHOOK_SECRET · CLIENT_ID · CLIENT_SECRET
