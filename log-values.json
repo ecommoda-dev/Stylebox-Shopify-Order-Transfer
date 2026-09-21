@@ -1,0 +1,31 @@
+{
+  "tool": "wc_order_transfer",
+  "since": null,
+  "types": {
+    "login": {
+      "result": null,
+      "stage": null,
+      "desc": "دخول موظف"
+    },
+    "logout": {
+      "result": null,
+      "stage": null,
+      "desc": "خروج موظف"
+    },
+    "created": {
+      "result": null,
+      "stage": null,
+      "desc": "الأوردر اتعمل على شوبيفاي من أوردر ووكومرس"
+    },
+    "error": {
+      "result": null,
+      "stage": null,
+      "desc": "فشل تحويل الأوردر من ووكومرس لشوبيفاي"
+    },
+    "skipped": {
+      "result": null,
+      "stage": null,
+      "desc": "الأوردر متحوّل قبل كده — اتجاهل"
+    }
+  }
+}
