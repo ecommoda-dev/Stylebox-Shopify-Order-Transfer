@@ -7,7 +7,7 @@
 **بتعمل إيه:** بتستقبل ويبهوك من WooCommerce (stylebox.online) وبتنشئ نفس الأوردر
 على Shopify تلقائيًا كأوردر COD، وبتعرض حالة النقل في شاشة عرض.
 **مين بيستخدمها:** إدارة · متابعة الأوردرات (الشاشة عرض فقط، مفيش أي أكشن).
-**الإصدار:** Worker `v2.5.0` · الواجهة `v1.0.0`   ← الاتنين مستقلين، طبيعي يختلفوا
+**الإصدار:** Worker `v2.5.1` · الواجهة `v1.0.0`   ← الاتنين مستقلين، طبيعي يختلفوا
 
 ## الروابط
 
@@ -150,13 +150,20 @@ git show a69fc43:index.js
 
 | المهارة | الإصدار وقت آخر تعديل |
 |---|---|
-| ecommoda-worker-builder | v3.0.0 |
+| ecommoda-worker-builder | v3.8.0 |
 | ecommoda-html-builder | v7.0.0 |
-| ecommoda-constants | v2.0.0 |
+| ecommoda-constants | v3.1.0 |
 | woocommerce-sync-helper | v1.0.0 |
 
-آخر مطابقة: 12-09-2026 · `index.js` v2.5.0 · `index.html` v1.0.0
+آخر مطابقة: 24-09-2026 · `index.js` v2.5.1 · `index.html` v1.0.0
 🔴 معلّقة: — لا شيء
+
+> ℹ️ **24-09-2026 — الطبقة ٥ (Step 7-ج):** `check-log-values.mjs` اتستبدل
+> بالنسخة المصلَّحة (كاشف مايعتمدش على أسماء الدوال + object shorthand
+> صريح)، و`§LOG-REG` (`LOG_REGISTRY` + `noteUnregisteredLogValues`) اتحط
+> في `writeLog`. خمس القيم الموجودة (`login`/`logout`/`created`/`error`/
+> `skipped`) كانت **مسجّلة بالفعل** في `log-values.json` — مفيش قيمة جديدة
+> اتضافت، البند ده مراقبة وقت التشغيل بس.
 
 ## مسائل مفتوحة
 
@@ -184,4 +191,4 @@ git show a69fc43:index.js
 
 </div>
 
-آخر تحديث: 12-09-2026 — 09:17
+آخر تحديث: 24-09-2026 — الطبقة ٥ (`check-log-values.mjs` المصلَّح + `§LOG-REG`)

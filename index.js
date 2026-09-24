@@ -81,7 +81,17 @@
 // ⚠️ الضرايب: shipping_total في WooCommerce **مش شامل** ضريبة الشحن
 // (shipping_tax حقل منفصل). المتجر شغال من غير ضرايب نهائيًا وده قرار
 // ثابت — لو اتغير في أي يوم، لازم يترجع للبند ده.
-// skills: worker-builder v3.0.0 · constants v2.0.0 · html-builder v7.0.0 — 12-09-2026
+//
+// v2.5.1 — 24-09-2026 — الطبقة ٥: الحارس الديناميكي لقيم اللوج (Step 7-ج
+// في ecommoda-worker-builder). استبدال check-log-values.mjs بالنسخة
+// المصلَّحة (كانت بتدوّر على `type:` بنقطتين بس، وobject shorthand زي
+// `{ tool, type }` كان بيعدّي في صمت — مش الحالة هنا لأن كل نداء في الملف
+// ده مكتوب صريح أصلاً، لكن التشيك اتستبدل زي ما هو مطلوب). §LOG-REG
+// أضيف قبل §SHARED: LOG_REGISTRY مبني من log-values.json (٥ قيم، زوج
+// tool/type)، والحارس اتحط في writeLog — مفيش رفض كتابة أبدًا، الصف
+// بيتكتب عادي وعليه extra._unregistered لو القيمة مش مسجّلة + UPSERT
+// صامت في log_value_alerts بعد الكتابة.
+// skills: worker-builder v3.8.0 · constants v3.1.0 · html-builder v7.0.0 — 24-09-2026
 // ══════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════
@@ -90,7 +100,7 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
-const WORKER_VERSION    = 'v2.5.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const WORKER_VERSION    = 'v2.5.1';  // ← بيرجع في ?action=get_config — حارس الواجهة
 const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
 
 // الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
@@ -144,6 +154,59 @@ function decodeHtmlEntities(str) {
     .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)));
 }
 
+// ════════════════════════════════════════════════════════════
+// §LOG-REG — الحارس الديناميكي لقيم اللوج (الطبقة ٥)
+// ════════════════════════════════════════════════════════════
+// قطعة الأداة دي بس من log-values.json اللي جنبها — بتتحدّث معاه في
+// نفس الـ commit. ممنوع شحن السجل الكامل بتاع كل الأدوات هنا.
+const LOG_REGISTRY = {
+  wc_order_transfer: new Set(['login', 'logout', 'created', 'error', 'skipped']),
+};
+
+const isRegisteredLogValue = (tool, type) => !!LOG_REGISTRY[tool]?.has(type);
+
+// UPSERT على (source_tool, tool, type) — صف واحد لكل قيمة، hits بيعدّ.
+// الحدث الكامل مش بيضيع: الصف الأصلي موجود في logs وعليه _unregistered،
+// والجدول ده فهرس مش سجل تاني — عشان كده dedupe مش صف لكل حدث.
+const LOG_ALERT_SQL = `
+  INSERT INTO log_value_alerts
+    (source_tool, tool, type, first_seen, last_seen, hits,
+     worker_version, sample_order_name, sample_employee, sample_notes)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(source_tool, tool, type) DO UPDATE SET
+    last_seen         = excluded.last_seen,
+    hits              = log_value_alerts.hits + excluded.hits,
+    worker_version    = excluded.worker_version,
+    sample_order_name = excluded.sample_order_name,
+    sample_employee   = excluded.sample_employee,
+    sample_notes      = excluded.sample_notes,
+    status            = CASE WHEN log_value_alerts.status = 'ignored'
+                             THEN 'ignored' ELSE 'open' END
+`;
+
+// فشل التنبيه ممنوع يأثر على أي حاجة — try/catch صامت. بتجمّع التكرار
+// جوّه نفس الدفعة في صف واحد (hits) قبل ما تكتب.
+async function noteUnregisteredLogValues(db, entries) {
+  const byPair = new Map();
+  for (const e of entries) {
+    const key = `${e.tool}\u0000${e.type}`;
+    const acc = byPair.get(key);
+    if (acc) { acc.hits++; continue; }
+    byPair.set(key, { entry: e, hits: 1 });
+  }
+  const now = new Date().toISOString();
+  for (const { entry, hits } of byPair.values()) {
+    try {
+      await db.prepare(LOG_ALERT_SQL).bind(
+        TOOL_NAME, entry.tool ?? '(بدون tool)', entry.type ?? '(بدون type)',
+        now, now, hits, WORKER_VERSION ?? null,
+        entry.orderName ?? null, entry.employee ?? null,
+        entry.notes ? String(entry.notes).slice(0, 200) : null,
+      ).run();
+    } catch (e) { /* متعمّد: التنبيه فهرس، وفشله أهون من تعطيل الأداة */ }
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // §SHARED — copy verbatim — never modify
 // Auth & Logging Functions — EcomModa D1 Pattern v1.3.0
@@ -179,6 +242,12 @@ async function registerPin(db, username, pin) {
 }
 
 async function writeLog(db, entry) {
+  // ⚠️ الحارس الديناميكي (الطبقة ٥ — §LOG-REG تحت) — مفيش رفض كتابة أبدًا.
+  const unregistered = !isRegisteredLogValue(entry.tool, entry.type);
+  const extra = unregistered
+    ? { ...(entry.extra || {}), _unregistered: true }
+    : entry.extra;
+
   await db.prepare(`
     INSERT INTO logs
       (timestamp, tool, type, employee, order_id, order_name,
@@ -197,8 +266,10 @@ async function writeLog(db, entry) {
     entry.valueBefore  ?? null,
     entry.valueAfter   ?? null,
     entry.notes        ?? null,
-    entry.extra ? JSON.stringify(entry.extra) : null
+    extra ? JSON.stringify(extra) : null
   ).run();
+
+  if (unregistered) await noteUnregisteredLogValues(db, [entry]);   // بعد الكتابة، مش قبلها
 }
 
 /**
