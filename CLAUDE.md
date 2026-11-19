@@ -2,7 +2,7 @@
 
 # نقل أوردرات StyleBox (`Stylebox-Shopify-Order-Transfer`)
 
-![version](https://img.shields.io/badge/version-v1.0.0-blue)
+![version](https://img.shields.io/badge/version-v1.1.0-blue)
 
 **بتعمل إيه:** بتستقبل ويبهوك من WooCommerce (stylebox.online) وبتنشئ نفس الأوردر
 على Shopify تلقائيًا كأوردر COD، وبتعرض حالة النقل في شاشة عرض.
@@ -146,17 +146,37 @@ git show a69fc43:index.js
 اللي **متأكَّد منه بالـ diff**: كوميت `v2.4.0` ما لمسش ولا سطر في `§WEBHOOK`
 ولا `§SHOPIFY` — يعني منطق النقل نفسه زي ما هو.
 
+## مواءمة 18-11-2026 — Worker v2.6.0 · الواجهة v1.1.0
+
+> مواءمة مع المهارات الحالية. الاختبار: تدفق الويبهوك كامل اتشغّل على الكود الفعلي بـ D1 وشوبيفاي مزيّفين (12 حالة — 18-11-2026).
+
+| الحاجة | قبل | بعد |
+|---|---|---|
+| إصدار API | `2026-01` | **`2026-10`** — كل وثيقة GraphQL اتفحصت على Shopify MCP |
+| `shopifyGQL` | `return resp.json()` وبس (عطل موثّق في المهارة) | **النسخة المعتمدة**: بترمي على فشل الشبكة · HTTP · رد مش JSON · `data.errors` · `data` فاضية + إعادة محاولة على `THROTTLED`/429/5xx + التقاط التكلفة |
+| `DraftOrderInput.customerId` | بيتبعت | **مُهمَل في 2026-10** → `purchasingEntity: { customerId }` |
+| ميتافيلد `stylebox_order_id` | بتتكتب من غير أي تأكيد | **متأكَّد منها**، وفشلها بعد اكتمال الأوردر = **warning** في `extra.warnings` — الرمي كان هيخلّيها `failed` فيتعاد الأوردر ويتكرر على شوبيفاي (⑩ ②) |
+| `getAccessToken` | محاولة واحدة | 3 محاولات + backoff |
+| حارس `WORKER_SECRET` | `!env.WORKER_SECRET` | `typeof`+`trim` (سر فاضي بمسافة كان بيعدّي) |
+| `diag` | فحوص D1 والمتغيّرات | + Shopify OAuth + الصلاحيات + `throttleStatus` + `actualQueryCost` + `read_all_orders` |
+| الواجهة | خروج يدوي بـ`confirm` | خروج تلقائي 60 د + خروج فوري · لون النص الثانوي أغمق |
+
 ## بصمة المهارات
 
 | المهارة | الإصدار وقت آخر تعديل |
 |---|---|
-| ecommoda-worker-builder | v3.8.0 |
-| ecommoda-html-builder | v7.0.0 |
-| ecommoda-constants | v3.1.0 |
-| woocommerce-sync-helper | v1.0.0 |
+| ecommoda-worker-builder | v4.0.0 |
+| ecommoda-html-builder | v9.1.0 |
+| ecommoda-constants | v6.0.0 |
+| shopify-graphql-helper | v3.0.1 |
+| woocommerce-sync-helper | v2.1.0 |
 
-آخر مطابقة: 24-09-2026 · `index.js` v2.5.1 · `index.html` v1.0.0
-🔴 معلّقة: — لا شيء
+آخر مطابقة: 18-11-2026 · `index.js` v2.6.0 · `index.html` v1.1.0
+🔴 معلّقة:
+- 🟡 **`paymentPending: true` في `draftOrderComplete` مُهمَل (Deprecated) في API `2026-10`** — لسه شغّال ومثبّت في docs شوبيفاي (اتأكد 18-11-2026)، فمفيش كسر دلوقتي. البديل (`paymentTerms` على الـ draft) بيغيّر سلوك الـ COD، فمتشالش من غير اختبار حي على أوردر حقيقي (Draft + Complete). لو شوبيفاي شالته في إصدار جاي، الأوردرات هتفشل بـ`failed` (قابلة لإعادة المحاولة) مش بتتكرر.
+- 🟡 **شاشة السجل لسه على الشكل القديم (قسم فلاتر فوق الجدول — `S47`) ومن غير تحكم في عرض الأعمدة (`S51`)** — معيار الجداول الجديد (فلاتر في رأس العمود + قايمة `position:fixed` + مقبض سحب العرض، `data-table-standard.md` §2 و§9ب) إعادة تصميم كبيرة لشاشة تشغيل حيّة. اتأجّلت **بقرار مقصود** 18-11-2026 (المهارة نفسها بتصنّفها 🟡 «عند أول فتح، مش في حملة») عشان ما تتغيّرش من غير مراجعة بصرية حقيقية. تتعمل في جلسة مخصصة بـ `templates/24_data-table-section.html` + اختبار Playwright.
+- 🟡 **Build watch paths** (chip لـ`index.js` وchip منفصل لـ`wrangler.toml`) — إعداد في داشبورد Cloudflare مش في الريبو، ماتأكدش منه من الجلسة دي.
+- ⚠️ **اختبار حي لازم بعد النشر:** اعمل أوردر ووكومرس تجريبي (status=processing) وتأكد: الأوردر اتعمل على شوبيفاي · العميل اتربط (`purchasingEntity` بدل `customerId` المُهمَل) · الشحن · ميتافيلد `stylebox_order_id` — ولو الميتافيلد فشلت هتلاقي `extra.warnings` في صف `created` مش `error`.
 
 > ℹ️ **24-09-2026 — الطبقة ٥ (Step 7-ج):** `check-log-values.mjs` اتستبدل
 > بالنسخة المصلَّحة (كاشف مايعتمدش على أسماء الدوال + object shorthand
@@ -189,6 +209,6 @@ git show a69fc43:index.js
 - 🟡 **`ecommoda-tool-migration-playbook` نفسها مالهاش رقم إصدار**، فمابتدخلش جدول
   البصمة فوق رغم إنها المهارة اللي حكمت النقل ده.
 
-</div>
+آخر تحديث: 18-11-2026 — 23:51 — مواءمة مع المهارات الحالية (API 2026-10 · shopifyGQL المعتمدة · purchasingEntity · warning بدل الفشل في الميتافيلد)
 
-آخر تحديث: 24-09-2026 — الطبقة ٥ (`check-log-values.mjs` المصلَّح + `§LOG-REG`)
+</div>

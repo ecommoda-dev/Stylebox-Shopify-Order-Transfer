@@ -2,7 +2,7 @@
 
 # Stylebox-Shopify-Order-Transfer
 
-![version](https://img.shields.io/badge/version-v1.0.0-blue)
+![version](https://img.shields.io/badge/version-v1.1.0-blue)
 
 نقل أوردرات **stylebox.online** (WooCommerce) إلى **Shopify** تلقائيًا، وشاشة عرض
 لمتابعة النقل.
@@ -46,4 +46,4 @@
 
 </div>
 
-آخر تحديث: 12-09-2026 — 09:17
+آخر تحديث: 18-11-2026 — 23:51

@@ -91,7 +91,15 @@
 // tool/type)، والحارس اتحط في writeLog — مفيش رفض كتابة أبدًا، الصف
 // بيتكتب عادي وعليه extra._unregistered لو القيمة مش مسجّلة + UPSERT
 // صامت في log_value_alerts بعد الكتابة.
-// skills: worker-builder v3.8.0 · constants v3.1.0 · html-builder v7.0.0 — 24-09-2026
+// v2.6.0 — 18-11-2026 — مواءمة مع المهارات الحالية: (١) API 2026-01 → 2026-10
+// بعد فحص كل وثيقة GraphQL على Shopify MCP؛ (٢) shopifyGQL بقت النسخة المعتمدة
+// (Step 5A ① — كانت `return resp.json()` وبس) + التقاط تكلفة الاستعلام (⑮)؛
+// (٣) getAccessToken بـ retry/backoff (⑯ ②)؛ (٤) `DraftOrderInput.customerId`
+// (مُهمَل في 2026-10) → `purchasingEntity: { customerId }`؛ (٥) كتابة ميتافيلد
+// `stylebox_order_id` بقت متأكَّد منها، وفشلها بعد اكتمال الأوردر = warning في
+// السجل مش فشل (الفشل كان هيعيد المحاولة ويكرّر الأوردر على شوبيفاي — ⑩ ②)؛
+// (٦) حارس WORKER_SECRET بـ typeof/trim.
+// skills: worker-builder v4.0.0 · constants v6.0.0 · shopify-graphql-helper v3.0.1 · woocommerce-sync-helper v2.1.0 · html-builder v9.1.0 — 18-11-2026
 // ══════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════
@@ -100,7 +108,7 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
-const WORKER_VERSION    = 'v2.5.1';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const WORKER_VERSION    = 'v2.6.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
 const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
 
 // الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
@@ -420,38 +428,112 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
+// §SHOPIFY::getAccessToken — التوكن والـ throttle bucket مشتركين بين كل Workers الستاك
+// (نفس الـ Custom App)، فالفشل العابر لازم يتعافى (worker-builder Step 5A ⑯ ②).
+// الاسم OAUTH_MAX_ATTEMPTS مقصود — وصفة الجرد بتدوّر عليه.
+const OAUTH_MAX_ATTEMPTS = 3;
+
 async function getAccessToken(env) {
-  const resp = await fetchWithTimeout(
-    `https://${env.SHOP_DOMAIN}/admin/oauth/access_token`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id:     env.CLIENT_ID,
-        client_secret: env.CLIENT_SECRET,
-        grant_type:    'client_credentials',
-      }),
+  let lastErr = null;
+  for (let attempt = 1; attempt <= OAUTH_MAX_ATTEMPTS; attempt++) {
+    try {
+      const resp = await fetchWithTimeout(
+        `https://${env.SHOP_DOMAIN}/admin/oauth/access_token`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            client_id:     env.CLIENT_ID,
+            client_secret: env.CLIENT_SECRET,
+            grant_type:    'client_credentials',
+          }),
+        }
+      );
+      if (!resp.ok) {
+        const retriable = resp.status === 429 || resp.status >= 500;
+        lastErr = new Error(`OAuth failed: ${resp.status}`);
+        if (retriable && attempt < OAUTH_MAX_ATTEMPTS) { await new Promise(r => setTimeout(r, 700 * attempt)); continue; }
+        throw lastErr;
+      }
+      const data = await resp.json();
+      if (!data.access_token) throw new Error('No access_token in OAuth response');
+      return data.access_token;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < OAUTH_MAX_ATTEMPTS) { await new Promise(r => setTimeout(r, 400 * attempt)); continue; }
+      throw lastErr;
     }
-  );
-  if (!resp.ok) throw new Error(`OAuth failed: ${resp.status}`);
-  const data = await resp.json();
-  if (!data.access_token) throw new Error('No access_token in OAuth response');
-  return data.access_token;
+  }
+  throw lastErr || new Error('OAuth: unknown failure');
 }
 
-async function shopifyGQL(env, token, query, variables = {}) {
-  const resp = await fetchWithTimeout(
-    `https://${env.SHOP_DOMAIN}/admin/api/2026-01/graphql.json`,
-    {
-      method:  'POST',
-      headers: {
-        'Content-Type':           'application/json',
-        'X-Shopify-Access-Token': token,
-      },
-      body: JSON.stringify({ query, variables }),
+// ⑮ تكلفة الاستعلام — للقياس بس (صفر اعتماد من الواجهة): throttleStatus = الرصيد
+//    المتبقي، actualQueryCost = النداء كلّف قد إيه.
+let _lastThrottle  = null;
+let _lastQueryCost = null;
+
+// 🔴 النسخة المعتمدة (worker-builder Step 5A ①) — بترمي على: فشل شبكة · HTTP status ·
+//    رد مش JSON · data.errors · data فاضية، + إعادة محاولة على THROTTLED.
+//    النسخة القديمة كانت `return resp.json()` وبس: 401/429/5xx وأخطاء GraphQL العلوية
+//    كانت بتعدّي كأنها رد سليم.
+async function shopifyGQL(env, token, query, variables = {}, opName = 'shopify', costLog = null) {
+  const MAX_ATTEMPTS = 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let resp, text;
+    try {
+      resp = await fetchWithTimeout(
+        `https://${env.SHOP_DOMAIN}/admin/api/2026-10/graphql.json`,
+        {
+          method:  'POST',
+          headers: {
+            'Content-Type':           'application/json',
+            'X-Shopify-Access-Token': token,
+          },
+          body: JSON.stringify({ query, variables }),
+        }
+      );
+      text = await resp.text();
+    } catch (e) {
+      lastErr = new Error(`${opName}: فشل الاتصال بشوبيفاي — ${e.message}`);
+      if (attempt < MAX_ATTEMPTS) { await new Promise(r => setTimeout(r, 400 * attempt)); continue; }
+      throw lastErr;
     }
-  );
-  return resp.json();
+
+    if (!resp.ok) {
+      const retriable = resp.status === 429 || resp.status >= 500;
+      lastErr = new Error(`${opName}: شوبيفاي ردّت HTTP ${resp.status} — ${text.slice(0, 180)}`);
+      if (retriable && attempt < MAX_ATTEMPTS) { await new Promise(r => setTimeout(r, 700 * attempt)); continue; }
+      throw lastErr;
+    }
+
+    let data;
+    try { data = JSON.parse(text); }
+    catch { throw new Error(`${opName}: رد شوبيفاي مش JSON صالح — ${text.slice(0, 180)}`); }
+
+    if (Array.isArray(data.errors) && data.errors.length) {
+      const codes = data.errors.map(e => e?.extensions?.code).filter(Boolean);
+      lastErr = new Error(
+        `${opName}: ${data.errors.map(e => e.message).join(' | ')}` +
+        (codes.length ? ` [${codes.join(',')}]` : '')
+      );
+      if (codes.includes('THROTTLED') && attempt < MAX_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, 1200 * attempt)); continue;
+      }
+      throw lastErr;
+    }
+
+    if (!data.data) throw new Error(`${opName}: رد شوبيفاي بدون data — ${text.slice(0, 180)}`);
+    const cost = data.extensions?.cost;
+    if (cost) {
+      if (cost.throttleStatus) _lastThrottle = cost.throttleStatus;
+      _lastQueryCost = { op: opName, requested: cost.requestedQueryCost ?? null, actual: cost.actualQueryCost ?? null };
+      if (costLog) costLog.push({ ..._lastQueryCost });
+    }
+    return data;
+  }
+  throw lastErr || new Error(`${opName}: فشل غير معروف`);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -684,7 +766,7 @@ async function findOrCreateCustomer(env, token, billing) {
  *
  * مصدر الحقول:
  *  · WooCommerce REST API v3 — order.shipping_total · order.shipping_lines[].method_title
- *  · Shopify GraphQL Admin 2026-01 — ShippingLineInput { priceWithCurrency, title }
+ *  · Shopify GraphQL Admin 2026-10 — ShippingLineInput { priceWithCurrency, title }
  *    ⚠️ `price` (Money) في نفس الـ input **deprecated** — المستخدم هنا
  *    `priceWithCurrency` (MoneyInput) زي `priceOverride` بالظبط.
  */
@@ -711,7 +793,7 @@ function buildShippingLine(body) {
  * التطابق 100% بدون الحاجة لاستدعاء Shopify لمعرفة سعر الكتالوج الحالي.
  *
  * مصدر priceOverride field: Shopify GraphQL Admin API — DraftOrderLineItemInput
- * متاح من API version 2025-01 فصاعدًا (2026-01 مدعوم بالكامل) —
+ * متاح من API version 2025-01 فصاعدًا (2026-10 مدعوم بالكامل — اتأكد على Shopify MCP 18-11-2026) —
  * https://shopify.dev/docs/api/admin-graphql/latest/input-objects/draftorderlineiteminput
  */
 function buildDraftInput(body, customerId) {
@@ -751,7 +833,8 @@ function buildDraftInput(body, customerId) {
     tags: ['StyleBox', '_worker_clone'],
   };
 
-  if (customerId) input.customerId = customerId;
+  // ⚠️ `DraftOrderInput.customerId` مُهمَل في 2026-10 → purchasingEntity (اتأكد على المخطط 18-11-2026)
+  if (customerId) input.purchasingEntity = { customerId };
   if (body.billing.email?.trim()) input.email = body.billing.email.trim();
 
   // ── ملاحظة العميل ── (v2.3.2 — كانت مفقودة بالكامل، customer_note
@@ -932,6 +1015,9 @@ async function syncOrderToShopify(body, env) {
       env, token, DRAFT_ORDER_COMPLETE_MUTATION, {
         id:               draftId,
         paymentGatewayId: env.COD_GATEWAY_ID || COD_GATEWAY_GID,
+        // ⚠️ `paymentPending` مُهمَل (Deprecated) في 2026-10 لكنه لسه شغّال ومثبّت في الـ docs.
+        //    البديل (paymentTerms على الـ draft) بيغيّر سلوك الـ COD — قرار مؤجَّل، مسجّل
+        //    في CLAUDE.md تحت «🔴 معلّقة». متشالش من غير اختبار حي على أوردر حقيقي.
         paymentPending:   true,
       }
     );
@@ -945,15 +1031,25 @@ async function syncOrderToShopify(body, env) {
     }
 
     // ── Set WooCommerce order ID metafield ────────────────────────────
-    await shopifyGQL(env, token, METAFIELDS_SET_MUTATION, {
-      metafields: [{
-        ownerId:   order.id,
-        namespace: 'custom',
-        key:       'stylebox_order_id',
-        value:     String(wcOrderId),  // number_integer يقبل string
-        type:      'number_integer',
-      }]
-    });
+    // 🔴 الأوردر اتكمّل على شوبيفاي خلاص — فشل الكتابة هنا مايرميش (الرمي = markOrderFailed
+    //    = إعادة محاولة = أوردر مكرّر على شوبيفاي). بيتسجّل warning ويتكمّل (worker-builder ⑩ ②).
+    const warnings = [];
+    try {
+      const mfRes = await shopifyGQL(env, token, METAFIELDS_SET_MUTATION, {
+        metafields: [{
+          ownerId:   order.id,
+          namespace: 'custom',
+          key:       'stylebox_order_id',
+          value:     String(wcOrderId),  // number_integer يقبل string
+          type:      'number_integer',
+        }]
+      }, 'metafieldsSet(stylebox_order_id)');
+      const mfErrs = mfRes.data?.metafieldsSet?.userErrors || [];
+      if (mfErrs.length) throw new Error(mfErrs.map(e => e.message).join(' | '));
+      if (!mfRes.data?.metafieldsSet?.metafields?.length) throw new Error('شوبيفاي ما أكدتش الميتافيلد');
+    } catch (e) {
+      warnings.push(`الأوردر اتعمل على شوبيفاي لكن ميتافيلد stylebox_order_id ما اتكتبش (${e.message}) — ضيفه يدويًا: WC #${wcOrderId}`);
+    }
 
     // ── Success — mark ledger + write log ─────────────────────────────
     const shopifyNumericId = order.id.replace('gid://shopify/Order/', '');
@@ -986,6 +1082,7 @@ async function syncOrderToShopify(body, env) {
         customer_phone:     normalizePhone(body.billing.phone),
         line_item_prices:   lineItemPrices,
         retried_after_failure: claim.retried,
+        ...(warnings.length ? { warnings } : {}),
       },
     });
 
@@ -1051,7 +1148,7 @@ export default {
     // 🔴 السر الناقص بيترد عليه برسالة باسمه — مش 401 غامض. من غير الحارس
     //    ده، سر اتضاف من غير Promote بيدّي "Unauthorized" على كل نداء
     //    والموظف بيدوّر في المكان الغلط.
-    if (!env.WORKER_SECRET) {
+    if (typeof env.WORKER_SECRET !== 'string' || !env.WORKER_SECRET.trim()) {
       return json({ ok: false, error: 'WORKER_SECRET ناقص في الـ Worker — ضيفه في Settings → Variables and Secrets ثم Promote', step: 'env' }, 500);
     }
     const authHeader = request.headers.get('Authorization') || '';
@@ -1131,13 +1228,39 @@ export default {
           checks.push({ ok: false, label: 'جدول employees', detail: `فشل الاستعلام: ${e.message}` });
         }
 
+        // شوبيفاي — OAuth + الصلاحيات + تكلفة الاستعلام (قراءة فقط، صفر كتابة)
+        try {
+          const token = await getAccessToken(env);
+          const d = await shopifyGQL(env, token,
+            '{ currentAppInstallation { accessScopes { handle } } }', {}, 'diagScopes');
+          const scopes = (d?.data?.currentAppInstallation?.accessScopes || []).map(x => x.handle);
+          checks.push({ ok: true, label: 'Shopify OAuth', detail: 'التوكن اتجاب بنجاح' });
+          checks.push({
+            ok: scopes.includes('write_draft_orders') && scopes.includes('write_orders'),
+            label: 'accessScopes',
+            detail: scopes.length ? scopes.join(', ') : '(فاضية — الأداة محتاجة write_draft_orders و write_orders)',
+          });
+          // ℹ️ read_all_orders: بدونها الأوردرات الأقدم من 60 يوم بترجع «غير موجود» بدل خطأ صلاحية —
+          //    الأداة دي بتنشئ أوردرات بس مابتقراش قديم، فالفحص معلومة مش شرط (shopify-graphql-helper §3.2).
+          checks.push({ ok: true, label: 'read_all_orders',
+            detail: scopes.includes('read_all_orders') ? 'ممنوحة' : 'غير ممنوحة — مش مطلوبة للأداة دي (بتنشئ أوردرات ومابتقراش قديم)' });
+          const t = d?.extensions?.cost?.throttleStatus;
+          if (t) checks.push({ ok: true, label: 'throttleStatus',
+            detail: `متاح ${t.currentlyAvailable} من ${t.maximumAvailable} · استرجاع ${t.restoreRate}/ث` });
+          const qc = d?.extensions?.cost;
+          if (qc) checks.push({ ok: true, label: 'actualQueryCost',
+            detail: `آخر نداء كلّف ${qc.actualQueryCost ?? '؟'} نقطة (المطلوب ${qc.requestedQueryCost ?? '؟'})` });
+        } catch (e) {
+          checks.push({ ok: false, label: 'Shopify', detail: `فشل: ${e.message}` });
+        }
+
         checks.push({
           ok:     true,
           label:  'CORS',
           detail: `wildcard * — الأداة قراءة فقط من الواجهة، والحماية في WORKER_SECRET. الطلب جاي من ${request.headers.get('Origin') || '(بدون Origin)'}`,
         });
 
-        return json({ ok: true, version: WORKER_VERSION, tool: TOOL_NAME, envKeys, checks });
+        return json({ ok: checks.every(c => c.ok), version: WORKER_VERSION, tool: TOOL_NAME, envKeys, checks });
       }
 
       assertEnv(env, ['DB']);
