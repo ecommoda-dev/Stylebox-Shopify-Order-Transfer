@@ -91,6 +91,8 @@
 // tool/type)، والحارس اتحط في writeLog — مفيش رفض كتابة أبدًا، الصف
 // بيتكتب عادي وعليه extra._unregistered لو القيمة مش مسجّلة + UPSERT
 // صامت في log_value_alerts بعد الكتابة.
+// v2.6.1 — 19-11-2026 — 🔴 إصلاح انحدار من v2.6.0: ربط العميل (findOrCreateCustomer) بقى best-effort —
+// فشله (ACCESS_DENIED على write_customers) بقى warning والأوردر بيتكمّل، بدل ما يفشل كل الأوردرات.
 // v2.6.0 — 18-11-2026 — مواءمة مع المهارات الحالية: (١) API 2026-01 → 2026-10
 // بعد فحص كل وثيقة GraphQL على Shopify MCP؛ (٢) shopifyGQL بقت النسخة المعتمدة
 // (Step 5A ① — كانت `return resp.json()` وبس) + التقاط تكلفة الاستعلام (⑮)؛
@@ -99,7 +101,7 @@
 // `stylebox_order_id` بقت متأكَّد منها، وفشلها بعد اكتمال الأوردر = warning في
 // السجل مش فشل (الفشل كان هيعيد المحاولة ويكرّر الأوردر على شوبيفاي — ⑩ ②)؛
 // (٦) حارس WORKER_SECRET بـ typeof/trim.
-// skills: worker-builder v4.0.0 · constants v6.0.0 · shopify-graphql-helper v3.0.1 · woocommerce-sync-helper v2.1.0 · html-builder v9.1.0 — 18-11-2026
+// skills: worker-builder v4.2.0 · constants v6.0.1 · shopify-graphql-helper v3.2.0 · woocommerce-sync-helper v2.1.1 · html-builder v9.1.1 — 19-11-2026
 // ══════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════
@@ -108,7 +110,7 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
-const WORKER_VERSION    = 'v2.6.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const WORKER_VERSION    = 'v2.6.1';  // ← بيرجع في ?action=get_config — حارس الواجهة
 const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
 
 // الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
@@ -990,7 +992,19 @@ async function syncOrderToShopify(body, env) {
     const token = await getAccessToken(env);
 
     // ── Customer lookup / create ─────────────────────────────────────
-    const customerId = await findOrCreateCustomer(env, token, body.billing);
+    // 🔴 ربط العميل **best-effort** — مش شرط لإنشاء الأوردر. (v2.6.1 — 19-11-2026)
+    //    الأوردر هو الأساس؛ العميل تكميلي. لما `shopifyGQL` بقت بترمي على أخطاء GraphQL
+    //    (v2.6.0)، غياب صلاحية `write_customers` على تطبيق شوبيفاي (ACCESS_DENIED على
+    //    customerCreate) وقّف **كل** الأوردرات الجديدة بدل ما يكمّلها من غير عميل زي ما
+    //    كان بيحصل. فشل اللوكب/الإنشاء بيتسجّل warning في extra.warnings والأوردر بيتكمّل
+    //    (worker-builder Step 5A ⑩ ②: الفشل التكميلي = warning مش error).
+    const warnings = [];
+    let customerId = null;
+    try {
+      customerId = await findOrCreateCustomer(env, token, body.billing);
+    } catch (e) {
+      warnings.push(`الأوردر اتعمل من غير ربط عميل على شوبيفاي (${e.message}) — لو الرسالة عن ACCESS_DENIED ادّي التطبيق صلاحية write_customers/read_customers`);
+    }
 
     // ── Build draft order input (يشمل priceOverride لكل line item) ───
     // ⚠️ ممكن يرمي error (مثلاً منتج لسه من غير global_unique_id) —
@@ -1033,7 +1047,6 @@ async function syncOrderToShopify(body, env) {
     // ── Set WooCommerce order ID metafield ────────────────────────────
     // 🔴 الأوردر اتكمّل على شوبيفاي خلاص — فشل الكتابة هنا مايرميش (الرمي = markOrderFailed
     //    = إعادة محاولة = أوردر مكرّر على شوبيفاي). بيتسجّل warning ويتكمّل (worker-builder ⑩ ②).
-    const warnings = [];
     try {
       const mfRes = await shopifyGQL(env, token, METAFIELDS_SET_MUTATION, {
         metafields: [{
@@ -1235,6 +1248,9 @@ export default {
             '{ currentAppInstallation { accessScopes { handle } } }', {}, 'diagScopes');
           const scopes = (d?.data?.currentAppInstallation?.accessScopes || []).map(x => x.handle);
           checks.push({ ok: true, label: 'Shopify OAuth', detail: 'التوكن اتجاب بنجاح' });
+          // ℹ️→❌ write_customers: من غيرها الأوردر بيتعمل بس من غير ربط عميل (warning في السجل)
+          checks.push({ ok: scopes.includes('write_customers'), label: 'write_customers',
+            detail: scopes.includes('write_customers') ? 'ممنوحة' : 'ناقصة — الأوردرات بتتعمل من غير ربط عميل. ضيفها في Shopify app (Dev Dashboard → Versions → Access scopes) وبعدها Release' });
           checks.push({
             ok: scopes.includes('write_draft_orders') && scopes.includes('write_orders'),
             label: 'accessScopes',

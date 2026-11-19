@@ -2,7 +2,7 @@
 
 # نقل أوردرات StyleBox (`Stylebox-Shopify-Order-Transfer`)
 
-![version](https://img.shields.io/badge/version-v1.1.0-blue)
+![version](https://img.shields.io/badge/version-v1.1.1-blue)
 
 **بتعمل إيه:** بتستقبل ويبهوك من WooCommerce (stylebox.online) وبتنشئ نفس الأوردر
 على Shopify تلقائيًا كأوردر COD، وبتعرض حالة النقل في شاشة عرض.
@@ -146,6 +146,23 @@ git show a69fc43:index.js
 اللي **متأكَّد منه بالـ diff**: كوميت `v2.4.0` ما لمسش ولا سطر في `§WEBHOOK`
 ولا `§SHOPIFY` — يعني منطق النقل نفسه زي ما هو.
 
+## 🔴 إصلاح انحدار — Worker v2.6.1 (19-11-2026)
+
+**العطل:** بعد نشر v2.6.0 الأوردرات الجديدة وقفت (`#25958` · `#25959` · `#25960` → `status=failed` في `wc_order_sync_ledger`) برسالة
+`Access denied for customerCreate field. Required access: write_customers access scope [ACCESS_DENIED]`.
+
+**السبب:** تطبيق شوبيفاي **معندوش صلاحية `write_customers`**. `shopifyGQL` القديمة (`return resp.json()`) كانت بتبلع الرفض، فالعميل بيطلع `null`
+والأوردر بيتعمل من غير عميل. v2.6.0 بدّلتها بالنسخة المعتمدة اللي **بترمي** — فبقى فشل إنشاء العميل بيوقف الأوردر كله. اختبار v2.6.0 ما مسكش ده
+لأن شوبيفاي المزيّف كان بيرد بنجاح على `customerCreate`.
+
+**الإصلاح:** ربط العميل بقى **best-effort** — فشل اللوكب أو الإنشاء بيتسجّل `warning` في `extra.warnings` والأوردر بيتكمّل (Step 5A ⑩ ②).
+و🩺 فحص النظام بقى فيه صف `write_customers` (❌ لو ناقصة).
+
+**اللي لسه محتاج منك:** ادّي التطبيق صلاحية `write_customers` (وراجع `read_customers`) في Shopify Dev Dashboard ← Versions ← Access scopes ← Release.
+لحد وقتها الأوردرات هتتعمل **بدون ربط عميل** (زي ما كان الوضع قبل v2.6.0 بالظبط).
+
+**الأوردرات اللي فشلت:** `#25958` · `#25959` · `#25960` — كل واحد منهم بيتعاد تلقائيًا أول ما ووكومرس يبعت `order.updated` تاني (احفظ الأوردر من wp-admin بدون تغيير).
+
 ## مواءمة 18-11-2026 — Worker v2.6.0 · الواجهة v1.1.0
 
 > مواءمة مع المهارات الحالية. الاختبار: تدفق الويبهوك كامل اتشغّل على الكود الفعلي بـ D1 وشوبيفاي مزيّفين (12 حالة — 18-11-2026).
@@ -165,13 +182,13 @@ git show a69fc43:index.js
 
 | المهارة | الإصدار وقت آخر تعديل |
 |---|---|
-| ecommoda-worker-builder | v4.0.0 |
-| ecommoda-html-builder | v9.1.0 |
-| ecommoda-constants | v6.0.0 |
-| shopify-graphql-helper | v3.0.1 |
-| woocommerce-sync-helper | v2.1.0 |
+| ecommoda-worker-builder | v4.2.0 |
+| ecommoda-html-builder | v9.1.1 |
+| ecommoda-constants | v6.0.1 |
+| shopify-graphql-helper | v3.2.0 |
+| woocommerce-sync-helper | v2.1.1 |
 
-آخر مطابقة: 18-11-2026 · `index.js` v2.6.0 · `index.html` v1.1.0
+آخر مطابقة: 19-11-2026 · `index.js` v2.6.1 · `index.html` v1.1.0
 🔴 معلّقة:
 - 🟡 **`paymentPending: true` في `draftOrderComplete` مُهمَل (Deprecated) في API `2026-10`** — لسه شغّال ومثبّت في docs شوبيفاي (اتأكد 18-11-2026)، فمفيش كسر دلوقتي. البديل (`paymentTerms` على الـ draft) بيغيّر سلوك الـ COD، فمتشالش من غير اختبار حي على أوردر حقيقي (Draft + Complete). لو شوبيفاي شالته في إصدار جاي، الأوردرات هتفشل بـ`failed` (قابلة لإعادة المحاولة) مش بتتكرر.
 - 🟡 **شاشة السجل لسه على الشكل القديم (قسم فلاتر فوق الجدول — `S47`) ومن غير تحكم في عرض الأعمدة (`S51`)** — معيار الجداول الجديد (فلاتر في رأس العمود + قايمة `position:fixed` + مقبض سحب العرض، `data-table-standard.md` §2 و§9ب) إعادة تصميم كبيرة لشاشة تشغيل حيّة. اتأجّلت **بقرار مقصود** 18-11-2026 (المهارة نفسها بتصنّفها 🟡 «عند أول فتح، مش في حملة») عشان ما تتغيّرش من غير مراجعة بصرية حقيقية. تتعمل في جلسة مخصصة بـ `templates/24_data-table-section.html` + اختبار Playwright.
@@ -209,6 +226,6 @@ git show a69fc43:index.js
 - 🟡 **`ecommoda-tool-migration-playbook` نفسها مالهاش رقم إصدار**، فمابتدخلش جدول
   البصمة فوق رغم إنها المهارة اللي حكمت النقل ده.
 
-آخر تحديث: 18-11-2026 — 23:51 — مواءمة مع المهارات الحالية (API 2026-10 · shopifyGQL المعتمدة · purchasingEntity · warning بدل الفشل في الميتافيلد)
+آخر تحديث: 19-11-2026 — إصلاح انحدار v2.6.1: ربط العميل best-effort (ACCESS_DENIED على write_customers)
 
 </div>
