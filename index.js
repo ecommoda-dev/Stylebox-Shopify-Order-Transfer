@@ -91,6 +91,14 @@
 // tool/type)، والحارس اتحط في writeLog — مفيش رفض كتابة أبدًا، الصف
 // بيتكتب عادي وعليه extra._unregistered لو القيمة مش مسجّلة + UPSERT
 // صامت في log_value_alerts بعد الكتابة.
+// v2.7.0 — 19-11-2026 — حماية دايمة من global_unique_id الفاضي + تنضيف مدخلات شكلية:
+// (١) P0: لو GTIN فاضي/مش رقمي الـ Worker بيحدد الـ variant على شوبيفاي بالـ SKU بتحقق رباعي
+//     (SKU موجود · variant واحد بالظبط · SKU مطابق حرفيًا · custom.wordpress_variation_id = item.variation_id)
+//     — فشل أي شرط = نفس الخطأ القديم + السبب (مفيش تخمين). المسار العادي (GTIN رقمي) صفر نداءات زيادة.
+//     محتاج صلاحية read_products على التطبيق (بتتفحص في ?action=diag).
+// (٢) P1: الرموز الرياضية في الاسم بتتشال · address1/address2 بتتقص على 255 والنص الكامل في note ·
+//     إيميل بدومين غلط (userErrors كلها على email) → إعادة محاولة واحدة من غير إيميل. كله بتحذير في extra.warnings.
+// ⚠️ P2 (shopify_draft_id في الـ ledger) متنفّذش — محتاج قرار أحمد وALTER TABLE على production.
 // v2.6.1 — 19-11-2026 — 🔴 إصلاح انحدار من v2.6.0: ربط العميل (findOrCreateCustomer) بقى best-effort —
 // فشله (ACCESS_DENIED على write_customers) بقى warning والأوردر بيتكمّل، بدل ما يفشل كل الأوردرات.
 // v2.6.0 — 18-11-2026 — مواءمة مع المهارات الحالية: (١) API 2026-01 → 2026-10
@@ -110,7 +118,7 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
-const WORKER_VERSION    = 'v2.6.1';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const WORKER_VERSION    = 'v2.7.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
 const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
 
 // الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
@@ -162,6 +170,21 @@ function decodeHtmlEntities(str) {
     .replace(/&nbsp;/g, ' ')
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+// ─── §HELPERS::sanitizers (v2.7.0) ────────────────────────────────────
+// شوبيفاي بترفض الاسم لو فيه رموز رياضية (\p{Sm}: + < = > | ~ …) — القاعدة: مانفشّلش أوردر بسبب بيانات شكلية.
+function cleanName(str) {
+  return String(decodeHtmlEntities(str) ?? '').replace(/\p{Sm}/gu, '').replace(/\s+/g, ' ').trim();
+}
+
+const ADDRESS_MAX = 255;   // حد شوبيفاي لـ address1/address2 (رسالة الخطأ: "exceeds maximum length of 255 characters")
+// يقص على حدود كلمة لو أمكن (آخر مسافة في النص)، وإلا قص حرفي.
+function truncateAtWord(str, max = ADDRESS_MAX) {
+  if (!str || str.length <= max) return str || '';
+  const cut = str.slice(0, max);
+  const sp  = cut.lastIndexOf(' ');
+  return (sp > max * 0.6 ? cut.slice(0, sp) : cut).trim();
 }
 
 // ════════════════════════════════════════════════════════════
@@ -605,17 +628,30 @@ function normalizePhone(phone) {
  * Handles: empty city (fallback to province name), phone normalization,
  * province code, and HTML entity decoding (v2.3.1 — راجع ملاحظة أعلى الملف)
  */
-function buildAddress(wcAddr) {
+function buildAddress(wcAddr, opts = {}) {
+  const { fallbackFirst = '', label = '', fullAddress = null } = opts;
   const provinceCode = toProvinceCode(wcAddr.state);
   const city = decodeHtmlEntities(wcAddr.city?.trim())
     || EG_PROVINCE_NAMES[provinceCode]  // fallback: اسم المحافظة
     || '';
 
+  // v2.7.0 — اسم نضيف: رموز رياضية بتتشال؛ الأول لو فضي → اسم الفاتورة → "-"
+  const firstName = cleanName(wcAddr.first_name) || cleanName(fallbackFirst) || '-';
+  const lastName  = cleanName(wcAddr.last_name);
+
+  // v2.7.0 — address1/address2 بحد 255؛ النص الكامل بيتجمّع في fullAddress عشان يروح note (الشحن بيعتمد عليه)
+  const fit = (raw, field) => {
+    const full = decodeHtmlEntities(raw) || '';
+    if (full.length <= ADDRESS_MAX) return full;
+    if (fullAddress) fullAddress.push({ label: `${label} ${field}`.trim(), full });
+    return truncateAtWord(full);
+  };
+
   return {
-    firstName:    decodeHtmlEntities(wcAddr.first_name)  || '',
-    lastName:     decodeHtmlEntities(wcAddr.last_name)   || '',
-    address1:     decodeHtmlEntities(wcAddr.address_1)   || '',
-    address2:     decodeHtmlEntities(wcAddr.address_2)   || '',
+    firstName,
+    lastName,
+    address1:     fit(wcAddr.address_1, 'address1'),
+    address2:     fit(wcAddr.address_2, 'address2'),
     city,
     provinceCode,
     countryCode:  'EG',
@@ -737,8 +773,8 @@ async function findOrCreateCustomer(env, token, billing) {
 
   // 3. Create new customer
   const createInput = {
-    firstName: decodeHtmlEntities(billing.first_name) || '',
-    lastName:  decodeHtmlEntities(billing.last_name)  || '',
+    firstName: cleanName(billing.first_name),
+    lastName:  cleanName(billing.last_name),
   };
   if (email) createInput.email = email;
   if (phone) createInput.phone = phone;
@@ -783,51 +819,114 @@ function buildShippingLine(body) {
   };
 }
 
+// ─── §WEBHOOK::resolveLineVariantIds (v2.7.0) ─────────────────────────
+const FALLBACK_VARIANT_QUERY = `
+  query FallbackVariant($q: String!) {
+    productVariants(first: 3, query: $q) {
+      nodes {
+        id
+        sku
+        product { id status }
+        wpv: metafield(namespace: "custom", key: "wordpress_variation_id") { value }
+      }
+    }
+  }
+`;
+
+/**
+ * يحدد variant شوبيفاي لسطر GTIN بتاعه فاضي/مش رقمي — SKU + custom.wordpress_variation_id.
+ * القبول (الأربعة مع بعض، وإلا بيرمي): ① item.sku موجود ② variant واحد بالظبط ③ node.sku === item.sku
+ * حرفيًا (بحث شوبيفاي بيرجّع نتايج قريبة) ④ node.wpv.value === String(item.variation_id).
+ * ⚠️ محتاج read_products — من غيرها ACCESS_DENIED (بيتفحص في diag).
+ * مفيش تخمين: أي شرط ناقص = نفس الخطأ القديم + السبب.
+ */
+async function resolveVariantByFallback(env, token, item, idx) {
+  const label = `Line item ${idx + 1} (${item.name || item.sku})`;
+  const fail  = (why) => new Error(
+    `${label} missing global_unique_id — product not synced to WooCommerce yet [fallback بالـ SKU فشل: ${why}]`
+  );
+  const sku = typeof item.sku === 'string' ? item.sku.trim() : '';
+  if (!sku) throw fail('item.sku فاضي');
+  if (item.variation_id === undefined || item.variation_id === null || item.variation_id === '' || String(item.variation_id) === '0') {
+    throw fail('item.variation_id مش موجود (مش سطر variation)');
+  }
+
+  let res;
+  try {
+    res = await shopifyGQL(env, token, FALLBACK_VARIANT_QUERY,
+      { q: `sku:"${sku.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` }, 'fallbackVariant');
+  } catch (e) {
+    throw fail(`استعلام شوبيفاي فشل — ${e.message}`);
+  }
+  const nodes = res.data?.productVariants?.nodes || [];
+  if (nodes.length !== 1) throw fail(`لقينا ${nodes.length} variant للـ SKU (لازم واحد بالظبط)`);
+  const node = nodes[0];
+  if (node.sku !== sku) throw fail(`SKU الراجع مختلف ("${node.sku}")`);
+  if (String(node.wpv?.value ?? '') !== String(item.variation_id)) {
+    throw fail(`custom.wordpress_variation_id (${node.wpv?.value ?? 'فاضي'}) ≠ variation_id (${item.variation_id})`);
+  }
+  return node.id;
+}
+
+/**
+ * بيرجّع مصفوفة variantId (GID) لكل سطر. المسار العادي (GTIN أرقام فقط) = صفر نداءات.
+ * الـ fallback بيتسجّل تحذير في warnings.
+ */
+async function resolveLineVariantIds(env, token, body, warnings) {
+  const ids = [];
+  for (let idx = 0; idx < body.line_items.length; idx++) {
+    const item = body.line_items[idx];
+    const gtin = typeof item.global_unique_id === 'string' || typeof item.global_unique_id === 'number'
+      ? String(item.global_unique_id).trim() : '';
+    if (/^\d+$/.test(gtin)) { ids.push(`gid://shopify/ProductVariant/${gtin}`); continue; }
+    const gid = await resolveVariantByFallback(env, token, item, idx);
+    warnings.push(`global_unique_id فاضي لسطر ${idx + 1} (SKU ${item.sku}) — اتحدد الـ variant بالـ SKU + custom.wordpress_variation_id`);
+    ids.push(gid);
+  }
+  return ids;
+}
+
 // ─── §WEBHOOK::buildDraftInput ────────────────────────────────────────
 /**
  * Build DraftOrderInput from WooCommerce order body
- * Throws if any line item is missing global_unique_id
+ * variantIds: ناتج resolveLineVariantIds (نفس ترتيب line_items) — الـ GTIN/fallback اتحسموا قبل كده.
  *
  * §PRICING: كل line item بياخد priceOverride بسعر الوحدة الفعلي من WC
  * (item.total / item.quantity) — يضمن إن سعر المنتج في الأوردر على Shopify
  * يكون مطابق تمامًا لسعر WooCommerce وقت البيع، حتى لو كتالوج Shopify مختلف
- * (أعلى أو أقل). الـ override بيتطبق دايمًا — مش conditional — عشان نضمن
- * التطابق 100% بدون الحاجة لاستدعاء Shopify لمعرفة سعر الكتالوج الحالي.
+ * (أعلى أو أقل). الـ override بيتطبق دايمًا — مش conditional.
  *
  * مصدر priceOverride field: Shopify GraphQL Admin API — DraftOrderLineItemInput
- * متاح من API version 2025-01 فصاعدًا (2026-10 مدعوم بالكامل — اتأكد على Shopify MCP 18-11-2026) —
  * https://shopify.dev/docs/api/admin-graphql/latest/input-objects/draftorderlineiteminput
  */
-function buildDraftInput(body, customerId) {
+function buildDraftInput(body, customerId, variantIds, warnings = []) {
   // Line items — requiresShipping: true مطلوبة صراحةً لكل line item
-  const lineItems = body.line_items.map((item, idx) => {
-    const gtin = item.global_unique_id;
-    if (!gtin) {
-      throw new Error(
-        `Line item ${idx + 1} (${item.name || item.sku}) missing global_unique_id — ` +
-        `product not synced to WooCommerce yet`
-      );
-    }
-    return {
-      variantId:        `gid://shopify/ProductVariant/${gtin}`,
-      quantity:         item.quantity,
-      requiresShipping: true,   // ← إلزامي — بدونه يظهر "Shipping not required"
-      priceOverride: {
-        amount:       getWCUnitPrice(item, idx),
-        currencyCode: STORE_CURRENCY,
-      },
-    };
-  });
+  const lineItems = body.line_items.map((item, idx) => ({
+    variantId:        variantIds[idx],
+    quantity:         item.quantity,
+    requiresShipping: true,   // ← إلزامي — بدونه يظهر "Shipping not required"
+    priceOverride: {
+      amount:       getWCUnitPrice(item, idx),
+      currencyCode: STORE_CURRENCY,
+    },
+  }));
 
   // Shipping address: استخدم shipping لو موجود، وإلا billing
   const wcShipping = body.shipping?.address_1?.trim()
     ? body.shipping
     : body.billing;
 
+  // v2.7.0 — العناوين الطويلة: بتتقص على 255 والنص الكامل بيروح note
+  const fullShip = [], fullBill = [];
+  const shippingAddress = buildAddress(wcShipping,  { fallbackFirst: body.billing?.first_name, label: 'shipping', fullAddress: fullShip });
+  const billingAddress  = buildAddress(body.billing, { fallbackFirst: body.billing?.first_name, label: 'billing',  fullAddress: fullBill });
+  // لو الشحن = الفاتورة (نفس النص) منكرّرش النوت
+  const longAddr = [...fullShip, ...fullBill.filter(b => !fullShip.some(x => x.full === b.full))];
+
   const input = {
     lineItems,
-    shippingAddress: buildAddress(wcShipping),
-    billingAddress:  buildAddress(body.billing),
+    shippingAddress,
+    billingAddress,
     // v2.5.0 — سطر الشحن بيتبعت دايمًا (كان محذوف بالكامل قبل كده — راجع
     // الهيدر). من غيره Shopify بيقفل الأوردر بإجمالي ناقص قيمة الشحن.
     shippingLine:    buildShippingLine(body),
@@ -839,11 +938,14 @@ function buildDraftInput(body, customerId) {
   if (customerId) input.purchasingEntity = { customerId };
   if (body.billing.email?.trim()) input.email = body.billing.email.trim();
 
-  // ── ملاحظة العميل ── (v2.3.2 — كانت مفقودة بالكامل، customer_note
-  // من WooCommerce متربطش أبداً بـ DraftOrderInput.note قبل كده)
-  if (body.customer_note?.trim()) {
-    input.note = decodeHtmlEntities(body.customer_note.trim());
+  // ── الملاحظة ── ملاحظة العميل (v2.3.2) + العناوين الكاملة المقصوصة (v2.7.0)
+  const noteParts = [];
+  if (body.customer_note?.trim()) noteParts.push(decodeHtmlEntities(body.customer_note.trim()));
+  for (const a of longAddr) {
+    noteParts.push(`العنوان الكامل (اتقص لحد ${ADDRESS_MAX}) [${a.label}]: ${a.full}`);
+    warnings.push(`${a.label} أطول من ${ADDRESS_MAX} حرف — اتقص والنص الكامل في note الأوردر`);
   }
+  if (noteParts.length) input.note = noteParts.join('\n\n');
 
   return input;
 }
@@ -1006,16 +1108,33 @@ async function syncOrderToShopify(body, env) {
       warnings.push(`الأوردر اتعمل من غير ربط عميل على شوبيفاي (${e.message}) — لو الرسالة عن ACCESS_DENIED ادّي التطبيق صلاحية write_customers/read_customers`);
     }
 
+    // ── تحديد variant كل سطر (GTIN، أو fallback بالـ SKU لو GTIN فاضي — v2.7.0) ──
+    // ⚠️ ممكن يرمي error (variant مش متحقق منه) — هيتمسك في catch تحت ويتعمله
+    // markOrderFailed (قابل لإعادة المحاولة)
+    const variantIds = await resolveLineVariantIds(env, token, body, warnings);
+
     // ── Build draft order input (يشمل priceOverride لكل line item) ───
-    // ⚠️ ممكن يرمي error (مثلاً منتج لسه من غير global_unique_id) —
-    // هيتمسك في catch تحت ويتعمله markOrderFailed (قابل لإعادة المحاولة)
-    const draftInput = buildDraftInput(body, customerId);
+    const draftInput = buildDraftInput(body, customerId, variantIds, warnings);
 
     // ── draftOrderCreate ──────────────────────────────────────────────
-    const draftResult = await shopifyGQL(
+    let draftResult = await shopifyGQL(
       env, token, DRAFT_ORDER_CREATE_MUTATION, { input: draftInput }
     );
-    const draftErrors = draftResult.data?.draftOrderCreate?.userErrors;
+    let draftErrors = draftResult.data?.draftOrderCreate?.userErrors;
+
+    // v2.7.0 — إيميل بدومين غلط: لو **كل** userErrors على حقل email → إعادة محاولة **مرة واحدة** من غير
+    // الإيميل (والأصلي في note). أي خطأ تاني يفشل زي ما هو — مش بنغطّي على أخطاء حقيقية.
+    const onlyEmailErrors = (errs) => errs?.length > 0 && errs.every(e => Array.isArray(e.field) && e.field[0] === 'email');
+    if (onlyEmailErrors(draftErrors) && draftInput.email) {
+      const badEmail = draftInput.email;
+      warnings.push(`الإيميل "${badEmail}" رفضته شوبيفاي (${draftErrors.map(e => e.message).join(' | ')}) — الأوردر اتعمل من غير إيميل والأصلي في note`);
+      delete draftInput.email;
+      draftInput.note = [draftInput.note, `إيميل العميل الأصلي (شوبيفاي رفضته): ${badEmail}`].filter(Boolean).join('\n\n');
+      draftResult = await shopifyGQL(
+        env, token, DRAFT_ORDER_CREATE_MUTATION, { input: draftInput }
+      );
+      draftErrors = draftResult.data?.draftOrderCreate?.userErrors;
+    }
     if (draftErrors?.length) {
       throw new Error(`draftOrderCreate failed: ${JSON.stringify(draftErrors)}`);
     }
@@ -1251,6 +1370,10 @@ export default {
           // ℹ️→❌ write_customers: من غيرها الأوردر بيتعمل بس من غير ربط عميل (warning في السجل)
           checks.push({ ok: scopes.includes('write_customers'), label: 'write_customers',
             detail: scopes.includes('write_customers') ? 'ممنوحة' : 'ناقصة — الأوردرات بتتعمل من غير ربط عميل. ضيفها في Shopify app (Dev Dashboard → Versions → Access scopes) وبعدها Release' });
+          // 🔴 read_products: الـ fallback بالـ SKU (v2.7.0) بيعتمد عليه لما global_unique_id يبقى فاضي.
+          //    من غيرها استعلام productVariants بيرجّع ACCESS_DENIED والأوردر ده بيفشل زي ما كان قبل v2.7.0.
+          checks.push({ ok: scopes.includes('read_products'), label: 'read_products',
+            detail: scopes.includes('read_products') ? 'ممنوحة' : 'ناقصة — fallback الـ SKU (لما GTIN فاضي) مش هيشتغل. ضيفها في Shopify app (Dev Dashboard → Versions → Access scopes) وبعدها Release' });
           checks.push({
             ok: scopes.includes('write_draft_orders') && scopes.includes('write_orders'),
             label: 'accessScopes',
