@@ -91,6 +91,7 @@
 // tool/type)، والحارس اتحط في writeLog — مفيش رفض كتابة أبدًا، الصف
 // بيتكتب عادي وعليه extra._unregistered لو القيمة مش مسجّلة + UPSERT
 // صامت في log_value_alerts بعد الكتابة.
+// v2.8.0 — 19-11-2026 — P2: حماية الأوردر العالق من التكرار (shopify_draft_id) — بند (٣) تحت.
 // v2.7.0 — 19-11-2026 — حماية دايمة من global_unique_id الفاضي + تنضيف مدخلات شكلية:
 // (١) P0: لو GTIN فاضي/مش رقمي الـ Worker بيحدد الـ variant على شوبيفاي بالـ SKU بتحقق رباعي
 //     (SKU موجود · variant واحد بالظبط · SKU مطابق حرفيًا · custom.wordpress_variation_id = item.variation_id)
@@ -98,7 +99,10 @@
 //     محتاج صلاحية read_products على التطبيق (بتتفحص في ?action=diag).
 // (٢) P1: الرموز الرياضية في الاسم بتتشال · address1/address2 بتتقص على 255 والنص الكامل في note ·
 //     إيميل بدومين غلط (userErrors كلها على email) → إعادة محاولة واحدة من غير إيميل. كله بتحذير في extra.warnings.
-// ⚠️ P2 (shopify_draft_id في الـ ledger) متنفّذش — محتاج قرار أحمد وALTER TABLE على production.
+// (٣) [v2.8.0] P2: عمود shopify_draft_id في wc_order_sync_ledger — بيتكتب فورًا بعد draftOrderCreate (قبل الـ complete)،
+//     وعند reclaim لصف عنده draft: استعلام draftOrder{status order} — لو اتكمّل → markOrderCompleted من غير أوردر جديد
+//     (يمنع التكرار لو الـ Worker وقع بين draftOrderComplete وmarkOrderCompleted). الكود شغّال قبل وبعد الـ ALTER:
+//     ALTER TABLE wc_order_sync_ledger ADD COLUMN shopify_draft_id TEXT;   (أحمد ينفّذها في D1 Console)
 // v2.6.1 — 19-11-2026 — 🔴 إصلاح انحدار من v2.6.0: ربط العميل (findOrCreateCustomer) بقى best-effort —
 // فشله (ACCESS_DENIED على write_customers) بقى warning والأوردر بيتكمّل، بدل ما يفشل كل الأوردرات.
 // v2.6.0 — 18-11-2026 — مواءمة مع المهارات الحالية: (١) API 2026-01 → 2026-10
@@ -118,7 +122,7 @@
 const TOOL_NAME         = 'wc_order_transfer';  // ⚠️ كان 'wc_sync' قبل كده — راجع ملاحظة الـ migration
 const COD_GATEWAY_GID   = 'gid://shopify/PaymentGateway/125688283458';
 const STORE_CURRENCY    = 'EGP';   // ⚠️ تأكد إن عملة المتجر على Shopify فعلاً EGP
-const WORKER_VERSION    = 'v2.7.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
+const WORKER_VERSION    = 'v2.8.0';  // ← بيرجع في ?action=get_config — حارس الواجهة
 const STALE_LEDGER_MS   = 3 * 60 * 1000;  // نفس عتبة STALE_IN_PROGRESS_MS — للعرض بس
 
 // الواجهة الوحيدة اللي بتنادي الـ Worker ده. القايمة **مقفولة** لأن appId جاي
@@ -736,6 +740,22 @@ const METAFIELDS_SET_MUTATION = `
   }
 `;
 
+// كتابة custom.stylebox_order_id — بترمي لو شوبيفاي ما أكدتش (المستدعي بيحوّلها warning)
+async function setOrderMetafield(env, token, orderGid, wcOrderId) {
+  const mfRes = await shopifyGQL(env, token, METAFIELDS_SET_MUTATION, {
+    metafields: [{
+      ownerId:   orderGid,
+      namespace: 'custom',
+      key:       'stylebox_order_id',
+      value:     String(wcOrderId),  // number_integer يقبل string
+      type:      'number_integer',
+    }]
+  }, 'metafieldsSet(stylebox_order_id)');
+  const mfErrs = mfRes.data?.metafieldsSet?.userErrors || [];
+  if (mfErrs.length) throw new Error(mfErrs.map(e => e.message).join(' | '));
+  if (!mfRes.data?.metafieldsSet?.metafields?.length) throw new Error('شوبيفاي ما أكدتش الميتافيلد');
+}
+
 // ─── §WEBHOOK::findOrCreateCustomer ──────────────────────────────────
 /**
  * Lookup sequence:
@@ -988,8 +1008,9 @@ async function claimOrder(db, wcOrderId) {
   }
 
   // الصف موجود بالفعل — نشوف حالته
+  // SELECT * عشان يشتغل قبل/بعد إضافة shopify_draft_id
   const existing = await db.prepare(
-    `SELECT status, claimed_at FROM wc_order_sync_ledger WHERE wc_order_id = ?`
+    `SELECT * FROM wc_order_sync_ledger WHERE wc_order_id = ?`
   ).bind(wcOrderId).first();
 
   const isStaleInProgress = existing?.status === 'in_progress'
@@ -1003,7 +1024,8 @@ async function claimOrder(db, wcOrderId) {
        WHERE wc_order_id = ? AND status = ? AND claimed_at = ?`
     ).bind(now, wcOrderId, existing.status, existing.claimed_at).run();
     if (reclaim.meta.changes === 1) {
-      return { claimed: true, retried: true };
+      // draftId: لو المحاولة السابقة وصلت لـ draftOrderCreate (العمود ممكن لسه مش موجود → undefined)
+      return { claimed: true, retried: true, draftId: existing.shopify_draft_id || null };
     }
   }
 
@@ -1022,6 +1044,38 @@ async function markOrderFailed(db, wcOrderId) {
   await db.prepare(
     `UPDATE wc_order_sync_ledger SET status = 'failed' WHERE wc_order_id = ?`
   ).bind(wcOrderId).run();
+}
+
+// ─── §WEBHOOK::draft recovery (P2 — v2.7.0) ───────────────────────────
+const DRAFT_STATUS_QUERY = `
+  query DraftStatus($id: ID!) {
+    draftOrder(id: $id) { id status order { id name displayFinancialStatus } }
+  }
+`;
+
+// بيتكتب فورًا بعد draftOrderCreate. فشله ممنوع يوقّف الأوردر (حماية تكميلية):
+// "no such column" = لسه الـ ALTER ما اتنفّذش → صامت. أي خطأ تاني → warning.
+async function saveDraftId(db, wcOrderId, draftId, warnings) {
+  try {
+    await db.prepare(
+      `UPDATE wc_order_sync_ledger SET shopify_draft_id = ? WHERE wc_order_id = ?`
+    ).bind(draftId, wcOrderId).run();
+  } catch (e) {
+    if (!/no such column/i.test(String(e?.message))) {
+      warnings.push(`shopify_draft_id ما اتكتبش في الـ ledger (${e.message}) — حماية الأوردر العالق مش فعّالة للأوردر ده`);
+    }
+  }
+}
+
+/**
+ * المحاولة السابقة وصلت لـ draftOrderCreate — هل الـ draft اتكمّل أوردر فعلًا؟
+ * بيرجّع {id, name} للأوردر لو اتكمّل، وإلا null (الـ draft مفتوح أو اتمسح → نكمّل عادي).
+ * ⚠️ لو الاستعلام نفسه فشل بيرمي — الأحسن الأوردر يفشل ويتعاد من إنه يتكرر على شوبيفاي.
+ */
+async function findCompletedOrderForDraft(env, token, draftId) {
+  const res = await shopifyGQL(env, token, DRAFT_STATUS_QUERY, { id: draftId }, 'draftStatus');
+  const d = res.data?.draftOrder;
+  return d?.order?.id ? d.order : null;
 }
 
 // ─── §WEBHOOK::processOrder (webhook entry point) ─────────────────────
@@ -1093,6 +1147,27 @@ async function syncOrderToShopify(body, env) {
     // ── Shopify OAuth token ──────────────────────────────────────────
     const token = await getAccessToken(env);
 
+    // ── استرجاع أوردر عالق (P2): الـ draft اتكمّل قبل كده؟ ───────────────
+    // لو الـ Worker وقع بعد draftOrderComplete وقبل markOrderCompleted، الأوردر موجود على شوبيفاي —
+    // نكمّل الـ ledger بدل ما نعمل أوردر مكرر.
+    const warnings = [];
+    if (claim.draftId) {
+      const done = await findCompletedOrderForDraft(env, token, claim.draftId);
+      if (done) {
+        const numericId = done.id.replace('gid://shopify/Order/', '');
+        try { await setOrderMetafield(env, token, done.id, wcOrderId); }
+        catch (e) { warnings.push(`الميتافيلد stylebox_order_id ما اتكتبش (${e.message}) — ضيفه يدويًا: WC #${wcOrderId}`); }
+        await markOrderCompleted(env.DB, wcOrderId, numericId, done.name);
+        await writeLog(env.DB, {
+          tool: TOOL_NAME, type: 'skipped', orderId: numericId, orderName: done.name,
+          notes: `WC #${wcOrderId} — اتعمل على شوبيفاي قبل كده (${done.name}) — الـ ledger اتصلّح من الـ draft من غير أوردر جديد`,
+          extra: { wc_order_id: wcOrderId, recovered_from_draft: claim.draftId, shopify_order_id: done.id,
+                   ...(warnings.length ? { warnings } : {}) },
+        });
+        return;
+      }
+    }
+
     // ── Customer lookup / create ─────────────────────────────────────
     // 🔴 ربط العميل **best-effort** — مش شرط لإنشاء الأوردر. (v2.6.1 — 19-11-2026)
     //    الأوردر هو الأساس؛ العميل تكميلي. لما `shopifyGQL` بقت بترمي على أخطاء GraphQL
@@ -1100,7 +1175,6 @@ async function syncOrderToShopify(body, env) {
     //    customerCreate) وقّف **كل** الأوردرات الجديدة بدل ما يكمّلها من غير عميل زي ما
     //    كان بيحصل. فشل اللوكب/الإنشاء بيتسجّل warning في extra.warnings والأوردر بيتكمّل
     //    (worker-builder Step 5A ⑩ ②: الفشل التكميلي = warning مش error).
-    const warnings = [];
     let customerId = null;
     try {
       customerId = await findOrCreateCustomer(env, token, body.billing);
@@ -1143,6 +1217,9 @@ async function syncOrderToShopify(body, env) {
       throw new Error(`no draftId returned — raw: ${JSON.stringify(draftResult).slice(0, 400)}`);
     }
 
+    // P2 — الـ draft id فورًا (قبل الـ complete) عشان أي reclaim بعد وقوع الـ Worker يقدر يتأكد
+    await saveDraftId(env.DB, wcOrderId, draftId, warnings);
+
     // ── draftOrderComplete → real order with COD gateway ──────────────
     const completeResult = await shopifyGQL(
       env, token, DRAFT_ORDER_COMPLETE_MUTATION, {
@@ -1167,18 +1244,7 @@ async function syncOrderToShopify(body, env) {
     // 🔴 الأوردر اتكمّل على شوبيفاي خلاص — فشل الكتابة هنا مايرميش (الرمي = markOrderFailed
     //    = إعادة محاولة = أوردر مكرّر على شوبيفاي). بيتسجّل warning ويتكمّل (worker-builder ⑩ ②).
     try {
-      const mfRes = await shopifyGQL(env, token, METAFIELDS_SET_MUTATION, {
-        metafields: [{
-          ownerId:   order.id,
-          namespace: 'custom',
-          key:       'stylebox_order_id',
-          value:     String(wcOrderId),  // number_integer يقبل string
-          type:      'number_integer',
-        }]
-      }, 'metafieldsSet(stylebox_order_id)');
-      const mfErrs = mfRes.data?.metafieldsSet?.userErrors || [];
-      if (mfErrs.length) throw new Error(mfErrs.map(e => e.message).join(' | '));
-      if (!mfRes.data?.metafieldsSet?.metafields?.length) throw new Error('شوبيفاي ما أكدتش الميتافيلد');
+      await setOrderMetafield(env, token, order.id, wcOrderId);
     } catch (e) {
       warnings.push(`الأوردر اتعمل على شوبيفاي لكن ميتافيلد stylebox_order_id ما اتكتبش (${e.message}) — ضيفه يدويًا: WC #${wcOrderId}`);
     }
@@ -1349,6 +1415,14 @@ export default {
           checks.push({ ok: true, label: 'جدول wc_order_sync_ledger', detail: `${row?.n ?? 0} صف — سجل الحماية من التكرار` });
         } catch (e) {
           checks.push({ ok: false, label: 'جدول wc_order_sync_ledger', detail: `فشل الاستعلام: ${e.message}` });
+        }
+
+        try {
+          await env.DB.prepare('SELECT shopify_draft_id FROM wc_order_sync_ledger LIMIT 1').first();
+          checks.push({ ok: true, label: 'ledger.shopify_draft_id', detail: 'العمود موجود — حماية الأوردر العالق فعّالة' });
+        } catch (e) {
+          checks.push({ ok: false, label: 'ledger.shopify_draft_id',
+            detail: 'العمود مش موجود — الحماية من التكرار بعد وقوع الـ Worker مش فعّالة. نفّذ في D1 Console: ALTER TABLE wc_order_sync_ledger ADD COLUMN shopify_draft_id TEXT;' });
         }
 
         try {

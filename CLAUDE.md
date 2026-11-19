@@ -7,7 +7,7 @@
 **بتعمل إيه:** بتستقبل ويبهوك من WooCommerce (stylebox.online) وبتنشئ نفس الأوردر
 على Shopify تلقائيًا كأوردر COD، وبتعرض حالة النقل في شاشة عرض.
 **مين بيستخدمها:** إدارة · متابعة الأوردرات (الشاشة عرض فقط، مفيش أي أكشن).
-**الإصدار:** Worker `v2.7.0` · الواجهة `v1.1.0`   ← الاتنين مستقلين، طبيعي يختلفوا
+**الإصدار:** Worker `v2.8.0` · الواجهة `v1.1.0`   ← الاتنين مستقلين، طبيعي يختلفوا
 
 ## الروابط
 
@@ -159,7 +159,11 @@ git show a69fc43:index.js
 
 🔴 **لازم أحمد يتأكد:** صلاحية **`read_products`** على تطبيق شوبيفاي (`?action=diag` بقى فيه صف `read_products`). من غيرها الـ fallback بيرجّع ACCESS_DENIED والأوردر بيفشل زي قبل.
 ✅ اتجرّب استعلام الـ fallback حيًا على Shopify MCP (`WA-SK-145 / Black / 46` → variant `55962731413826` · `wordpress_variation_id=14104` · المنتج `DRAFT`). ⚠️ **لسه ما اتجرّبش** إن `draftOrderCreate` يقبل variant تابع لمنتج DRAFT — الاختبار الحي بأوردر تجريبي (أحمد).
-⚠️ **P2 (`shopify_draft_id` في الـ ledger — خطر أوردر مكرر بعد in_progress عالق) متنفّذش** — محتاج قرار أحمد + `ALTER TABLE`. راجع ملف المواصفات §٤.
+### 🛡️ v2.8.0 — P2: حماية الأوردر العالق من التكرار (`shopify_draft_id`)
+**الخطر:** الـ Worker يقع بعد `draftOrderComplete` وقبل `markOrderCompleted` (حصل في `23795` → `#57067`) → أول ويبهوك `processing` بعد 3 دقايق كان هيعمل أوردر **مكرر**.
+**الحل:** الـ draft id بيتكتب في `wc_order_sync_ledger.shopify_draft_id` فورًا بعد `draftOrderCreate`. وعند reclaim (`failed` أو `in_progress` stale) لصف عنده draft id: `draftOrder(id){ order }` — لو اتكمّل ← `markOrderCompleted` + إعادة كتابة الميتافيلد + صف `skipped` فيه `extra.recovered_from_draft`، **من غير أوردر جديد**. لو الـ draft مفتوح/اتمسح ← الإنشاء العادي. لو استعلام الـ draft نفسه فشل ← الأوردر `failed` (أأمن من التكرار).
+**الـ ALTER (أحمد — D1 Console، سطر واحد):** `ALTER TABLE wc_order_sync_ledger ADD COLUMN shopify_draft_id TEXT;` — الكود شغّال قبله وبعده (`SELECT *` + "no such column" صامت)، و`?action=diag` فيه صف `ledger.shopify_draft_id` بيقول لو لسه ناقص.
+⚠️ الحماية مش بتغطّي الأوردرات اللي وقعت **قبل** الـ ALTER (مفيش draft id متسجّل ليها).
 ⛔ **ممنوع إعادة تشغيل الأوردرات الفاشلة جماعيًا** — بعضها اتعمل يدوي على شوبيفاي (قرار لكل أوردر).
 
 ## 🔴 إصلاح انحدار — Worker v2.6.1 (19-11-2026)
@@ -204,9 +208,9 @@ git show a69fc43:index.js
 | shopify-graphql-helper | v3.2.0 |
 | woocommerce-sync-helper | v2.1.1 |
 
-آخر مطابقة: 19-11-2026 · `index.js` v2.7.0 · `index.html` v1.1.0
+آخر مطابقة: 19-11-2026 · `index.js` v2.8.0 · `index.html` v1.1.0
 🔴 معلّقة:
-- 🔴 **صلاحية `read_products`** على تطبيق شوبيفاي (للـ fallback — v2.7.0) + اختبار حي بأوردر تجريبي (variant من منتج DRAFT) + قرار P2 (`shopify_draft_id`).
+- 🔴 **صلاحية `read_products`** على تطبيق شوبيفاي (للـ fallback — v2.7.0) + اختبار حي بأوردر تجريبي (variant من منتج DRAFT) + تنفيذ الـ `ALTER TABLE` بتاع `shopify_draft_id` (v2.8.0).
 - 🟡 **`paymentPending: true` في `draftOrderComplete` مُهمَل (Deprecated) في API `2026-10`** — لسه شغّال ومثبّت في docs شوبيفاي (اتأكد 18-11-2026)، فمفيش كسر دلوقتي. البديل (`paymentTerms` على الـ draft) بيغيّر سلوك الـ COD، فمتشالش من غير اختبار حي على أوردر حقيقي (Draft + Complete). لو شوبيفاي شالته في إصدار جاي، الأوردرات هتفشل بـ`failed` (قابلة لإعادة المحاولة) مش بتتكرر.
 - 🟡 **شاشة السجل لسه على الشكل القديم (قسم فلاتر فوق الجدول — `S47`) ومن غير تحكم في عرض الأعمدة (`S51`)** — معيار الجداول الجديد (فلاتر في رأس العمود + قايمة `position:fixed` + مقبض سحب العرض، `data-table-standard.md` §2 و§9ب) إعادة تصميم كبيرة لشاشة تشغيل حيّة. اتأجّلت **بقرار مقصود** 18-11-2026 (المهارة نفسها بتصنّفها 🟡 «عند أول فتح، مش في حملة») عشان ما تتغيّرش من غير مراجعة بصرية حقيقية. تتعمل في جلسة مخصصة بـ `templates/24_data-table-section.html` + اختبار Playwright.
 - 🟡 **Build watch paths** (chip لـ`index.js` وchip منفصل لـ`wrangler.toml`) — إعداد في داشبورد Cloudflare مش في الريبو، ماتأكدش منه من الجلسة دي.
@@ -243,6 +247,6 @@ git show a69fc43:index.js
 - 🟡 **`ecommoda-tool-migration-playbook` نفسها مالهاش رقم إصدار**، فمابتدخلش جدول
   البصمة فوق رغم إنها المهارة اللي حكمت النقل ده.
 
-آخر تحديث: 19-11-2026 — v2.7.0: fallback الـ SKU لـ global_unique_id الفاضي + تنضيف الاسم/العنوان/الإيميل
+آخر تحديث: 19-11-2026 — v2.8.0: حماية الأوردر العالق (shopify_draft_id) فوق fallback الـ SKU وتنضيف المدخلات
 
 </div>
