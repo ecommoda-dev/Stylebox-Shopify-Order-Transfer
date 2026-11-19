@@ -157,7 +157,7 @@ git show a69fc43:index.js
 | **P1-٢ عنوان > 255** | `address1`/`address2` بيتقصوا على حدود كلمة والنص الكامل في `input.note` + تحذير |
 | **P1-٣ إيميل غلط** | لو `userErrors` كلها على `email` → إعادة محاولة **واحدة** من غير إيميل، والأصلي في note + تحذير |
 
-🔴 **لازم أحمد يتأكد:** صلاحية **`read_products`** على تطبيق شوبيفاي (`?action=diag` بقى فيه صف `read_products`). من غيرها الـ fallback بيرجّع ACCESS_DENIED والأوردر بيفشل زي قبل.
+✅ صلاحية **`read_products`** ممنوحة (19-11-2026). `?action=diag` فيه صف `read_products` — من غيرها الـ fallback بيرجّع ACCESS_DENIED.
 ✅ اتجرّب استعلام الـ fallback حيًا على Shopify MCP (`WA-SK-145 / Black / 46` → variant `55962731413826` · `wordpress_variation_id=14104` · المنتج `DRAFT`). ⚠️ **لسه ما اتجرّبش** إن `draftOrderCreate` يقبل variant تابع لمنتج DRAFT — الاختبار الحي بأوردر تجريبي (أحمد).
 ### 🛡️ v2.8.0 — P2: حماية الأوردر العالق من التكرار (`shopify_draft_id`)
 **الخطر:** الـ Worker يقع بعد `draftOrderComplete` وقبل `markOrderCompleted` (حصل في `23795` → `#57067`) → أول ويبهوك `processing` بعد 3 دقايق كان هيعمل أوردر **مكرر**.
@@ -210,7 +210,7 @@ git show a69fc43:index.js
 
 آخر مطابقة: 19-11-2026 · `index.js` v2.8.0 · `index.html` v1.1.0
 🔴 معلّقة:
-- 🔴 **صلاحية `read_products`** على تطبيق شوبيفاي (للـ fallback — v2.7.0) + اختبار حي بأوردر تجريبي (variant من منتج DRAFT) + تنفيذ الـ `ALTER TABLE` بتاع `shopify_draft_id` (v2.8.0).
+- ✅ **اتقفل 19-11-2026:** `read_products` ممنوحة (اتأكدت من `?action=diag`) و`ALTER TABLE … shopify_draft_id` اتنفّذ (اتأكد بـ `pragma_table_info`). 🔴 **لسه:** اختبار حي بأوردر تجريبي (variant من منتج DRAFT).
 - 🟡 **`paymentPending: true` في `draftOrderComplete` مُهمَل (Deprecated) في API `2026-10`** — لسه شغّال ومثبّت في docs شوبيفاي (اتأكد 18-11-2026)، فمفيش كسر دلوقتي. البديل (`paymentTerms` على الـ draft) بيغيّر سلوك الـ COD، فمتشالش من غير اختبار حي على أوردر حقيقي (Draft + Complete). لو شوبيفاي شالته في إصدار جاي، الأوردرات هتفشل بـ`failed` (قابلة لإعادة المحاولة) مش بتتكرر.
 - 🟡 **شاشة السجل لسه على الشكل القديم (قسم فلاتر فوق الجدول — `S47`) ومن غير تحكم في عرض الأعمدة (`S51`)** — معيار الجداول الجديد (فلاتر في رأس العمود + قايمة `position:fixed` + مقبض سحب العرض، `data-table-standard.md` §2 و§9ب) إعادة تصميم كبيرة لشاشة تشغيل حيّة. اتأجّلت **بقرار مقصود** 18-11-2026 (المهارة نفسها بتصنّفها 🟡 «عند أول فتح، مش في حملة») عشان ما تتغيّرش من غير مراجعة بصرية حقيقية. تتعمل في جلسة مخصصة بـ `templates/24_data-table-section.html` + اختبار Playwright.
 - 🟡 **Build watch paths** (chip لـ`index.js` وchip منفصل لـ`wrangler.toml`) — إعداد في داشبورد Cloudflare مش في الريبو، ماتأكدش منه من الجلسة دي.
